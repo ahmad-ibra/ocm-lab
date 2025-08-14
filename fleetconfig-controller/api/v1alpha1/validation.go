@@ -23,10 +23,11 @@ import (
 //   - spec.addOnConfig
 //   - spec.registrationAuth.*
 //   - spec.hub.clusterManager.source.*
+//   - spec.spokes[*].addOns
 //   - spec.spokes[*].klusterlet.annotations
 //   - spec.spokes[*].klusterlet.source.*
 //   - spec.spokes[*].klusterlet.values
-//   - spec.spokes[*].addOns
+//   - spec.spokes[*].kubeconfig
 func allowFleetConfigUpdate(newObject *FleetConfig, oldObject *FleetConfig) error {
 
 	// Hub check
@@ -65,6 +66,8 @@ func allowFleetConfigUpdate(newObject *FleetConfig, oldObject *FleetConfig) erro
 				newSpokeCopy.Klusterlet.Source = (OCMSource{})
 				oldSpokeCopy.Klusterlet.Values = nil
 				newSpokeCopy.Klusterlet.Values = nil
+				oldSpokeCopy.Kubeconfig = Kubeconfig{}
+				newSpokeCopy.Kubeconfig = Kubeconfig{}
 				newSpokeCopy.AddOns = []AddOn{}
 				oldSpokeCopy.AddOns = []AddOn{}
 
