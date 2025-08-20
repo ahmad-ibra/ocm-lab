@@ -9,11 +9,14 @@ import (
 	"regexp"
 	"slices"
 	"strings"
+	"time"
 
 	certificatesv1 "k8s.io/api/certificates/v1"
 	corev1 "k8s.io/api/core/v1"
 	kerrs "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/wait"
+	workapi "open-cluster-management.io/api/client/work/clientset/versioned"
 	clusterv1 "open-cluster-management.io/api/cluster/v1"
 	operatorv1 "open-cluster-management.io/api/operator/v1"
 	workv1 "open-cluster-management.io/api/work/v1"
@@ -32,8 +35,10 @@ import (
 var csrSuffixPattern = regexp.MustCompile(`-[a-zA-Z0-9]{5}$`)
 
 const (
-	amwExistsError      = "you should manually clean them, uninstall kluster will cause those works out of control."
-	managedClusterAddOn = "ManagedClusterAddOn"
+	amwExistsError           = "you should manually clean them, uninstall kluster will cause those works out of control."
+	managedClusterAddOn      = "ManagedClusterAddOn"
+	addonCleanupTimeout      = 1 * time.Minute
+	addonCleanupPollInterval = 2 * time.Second
 )
 
 // handleSpokes manages Spoke cluster join and upgrade operations
@@ -575,6 +580,7 @@ func deregisterSpoke(ctx context.Context, kClient client.Client, hubKubeconfig [
 	if err != nil {
 		return err
 	}
+
 	// skip clean up if the ManagedCluster resource is not found or if any manifestWorks exist
 	managedCluster, err := clusterC.ClusterV1().ManagedClusters().Get(ctx, spoke.Name, metav1.GetOptions{})
 	if kerrs.IsNotFound(err) {
@@ -599,16 +605,25 @@ func deregisterSpoke(ctx context.Context, kClient client.Client, hubKubeconfig [
 	// remove addons only after confirming that the cluster can be unjoined - this avoids leaving dangling resources that may rely on the addon
 	if err := handleAddonDisable(ctx, spoke.Name, spoke.EnabledAddons); err != nil {
 		fc.SetConditions(true, v1alpha1.NewCondition(
-			"AddonsDisabled", spoke.AddonDisableType(), metav1.ConditionFalse, metav1.ConditionTrue,
+			err.Error(), spoke.AddonDisableType(), metav1.ConditionFalse, metav1.ConditionTrue,
 		))
 		return err
 	}
+
 	if len(spoke.EnabledAddons) > 0 {
+		// Wait for addon manifestWorks to be fully cleaned up before proceeding with unjoin
+		if err := waitForAddonManifestWorksCleanup(ctx, workC, spoke.Name, addonCleanupTimeout); err != nil {
+			fc.SetConditions(true, v1alpha1.NewCondition(
+				err.Error(), spoke.AddonDisableType(), metav1.ConditionFalse, metav1.ConditionTrue,
+			))
+			return fmt.Errorf("addon manifestWorks cleanup failed: %w", err)
+		}
 		fc.SetConditions(true, v1alpha1.NewCondition(
 			"AddonsDisabled", spoke.AddonDisableType(), metav1.ConditionTrue, metav1.ConditionTrue,
 		))
 	}
-	// unjoin spoke
+
+	// unjoin spoke - safe to proceed now that addon cleanup is confirmed
 	if err := unjoinSpoke(ctx, kClient, fc, spoke); err != nil {
 		return err
 	}
@@ -628,14 +643,14 @@ func deregisterSpoke(ctx context.Context, kClient client.Client, hubKubeconfig [
 	}
 
 	// remove ManagedCluster
-	if err = clusterC.ClusterV1().ManagedClusters().Delete(ctx, spoke.Name, metav1.DeleteOptions{}); err != nil && !kerrs.IsNotFound(err) {
-		return err
+	if err = clusterC.ClusterV1().ManagedClusters().Delete(ctx, spoke.Name, metav1.DeleteOptions{}); err != nil {
+		return client.IgnoreNotFound(err)
 	}
 
 	// remove Namespace
 	ns := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: spoke.Name}}
-	if err := kClient.Delete(ctx, ns); err != nil && !kerrs.IsNotFound(err) {
-		return err
+	if err := kClient.Delete(ctx, ns); err != nil {
+		return client.IgnoreNotFound(err)
 	}
 
 	return nil
@@ -650,6 +665,41 @@ func allOwnersAddOns(mws []workv1.ManifestWork) bool {
 		}
 	}
 	return true
+}
+
+// waitForAddonManifestWorksCleanup polls for addon-related manifestWorks to be removed
+// after addon disable operation to avoid race conditions during spoke unjoin
+func waitForAddonManifestWorksCleanup(ctx context.Context, workC *workapi.Clientset, spokeName string, timeout time.Duration) error {
+	logger := log.FromContext(ctx)
+	logger.V(1).Info("waiting for addon manifestWorks cleanup", "spokeName", spokeName, "timeout", timeout)
+
+	err := wait.PollUntilContextTimeout(ctx, addonCleanupPollInterval, timeout, true, func(ctx context.Context) (bool, error) {
+		manifestWorks, err := workC.WorkV1().ManifestWorks(spokeName).List(ctx, metav1.ListOptions{})
+		if err != nil {
+			logger.V(3).Info("failed to list manifestWorks during cleanup wait", "error", err)
+			// Return false to continue polling on transient errors
+			return false, nil
+		}
+
+		// Success condition: no manifestWorks remaining
+		if len(manifestWorks.Items) == 0 {
+			logger.V(1).Info("addon manifestWorks cleanup completed", "spokeName", spokeName, "remainingManifestWorks", len(manifestWorks.Items))
+			return true, nil
+		}
+
+		logger.V(3).Info("waiting for addon manifestWorks cleanup",
+			"spokeName", spokeName,
+			"addonManifestWorks", len(manifestWorks.Items))
+
+		// Continue polling
+		return false, nil
+	})
+
+	if err != nil {
+		return fmt.Errorf("timeout waiting for addon manifestWorks cleanup for spoke %s: %w", spokeName, err)
+	}
+
+	return nil
 }
 
 // prepareKlusterletValuesFile creates a temporary file with klusterlet values and returns
