@@ -141,14 +141,17 @@ func validateAddonConfigs(ctx context.Context, client client.Client, oldObject, 
 			mcAddOns, err := getManagedClusterAddOns(ctx)
 			if err != nil {
 				errs = append(errs, field.InternalError(field.NewPath("addOnConfigs"), err))
-			} else {
-				// Check if any removed addon configs are still in use
-				for _, removedConfig := range removedAddOnConfigs {
-					if isAddonConfigInUse(mcAddOns, removedConfig) {
-						errs = append(errs, field.Invalid(field.NewPath("addOnConfigs"), removedConfig,
-							fmt.Sprintf("cannot remove addon config %s as it is still in use by managedclusteraddons", removedConfig)))
-					}
+				return errs
+			}
+			var inUseAddOnConfigs []string
+			for _, removedConfig := range removedAddOnConfigs {
+				if isAddondEnabled(mcAddOns, removedConfig) {
+					inUseAddOnConfigs = append(inUseAddOnConfigs, removedConfig)
 				}
+			}
+			if len(inUseAddOnConfigs) > 0 {
+				errs = append(errs, field.Invalid(field.NewPath("addOnConfigs"), inUseAddOnConfigs,
+					fmt.Sprintf("cannot remove addOnConfigs %v as they are still in use by managedclusteraddons", inUseAddOnConfigs)))
 			}
 		}
 	}
@@ -163,11 +166,74 @@ func validateAddons(newObject *FleetConfig) field.ErrorList {
 	for _, ca := range newObject.Spec.AddOnConfigs {
 		configuredAddons[ca.Name] = true
 	}
+	for _, ha := range newObject.Spec.HubAddOns {
+		configuredAddons[ha.Name] = true
+	}
 	for i, s := range newObject.Spec.Spokes {
 		for j, a := range s.AddOns {
 			if !configuredAddons[a.ConfigName] {
 				errs = append(errs, field.Invalid(field.NewPath("Spokes").Index(i).Child("AddOns").Index(j), a.ConfigName, fmt.Sprintf("cannot enable addon %s for spoke %s, no configuration found in spec.AddOnConfigs", a.ConfigName, s.Name)))
 			}
+		}
+	}
+
+	return errs
+}
+
+// validateHubAddons validates HubAddOn configurations and usage
+func validateHubAddons(ctx context.Context, oldObject, newObject *FleetConfig) field.ErrorList {
+	errs := field.ErrorList{}
+
+	// Check for name clashes between HubAddOns and AddOnConfigs
+	addOnConfigNames := make(map[string]struct{})
+	for _, ac := range newObject.Spec.AddOnConfigs {
+		addOnConfigNames[ac.Name] = struct{}{}
+	}
+
+	for i, ha := range newObject.Spec.HubAddOns {
+		if _, found := addOnConfigNames[ha.Name]; found {
+			errs = append(errs, field.Invalid(field.NewPath("hubAddOn").Index(i), ha.Name,
+				fmt.Sprintf("hubAddOn name %s clashes with an existing addOnConfig name", ha.Name)))
+		}
+	}
+
+	// Check if any removed hub addons are still in use by managed cluster addons
+	if oldObject != nil {
+		oldHubAddOns := make(map[string]struct{})
+		for _, ha := range oldObject.Spec.HubAddOns {
+			oldHubAddOns[ha.Name] = struct{}{}
+		}
+
+		newHubAddOns := make(map[string]struct{})
+		for _, ha := range newObject.Spec.HubAddOns {
+			newHubAddOns[ha.Name] = struct{}{}
+		}
+
+		removedHubAddOns := make([]string, 0)
+		for name := range oldHubAddOns {
+			if _, found := newHubAddOns[name]; !found {
+				removedHubAddOns = append(removedHubAddOns, name)
+			}
+		}
+
+		// Check if any removed hub addons are still in use by managed cluster addons
+		if len(removedHubAddOns) > 0 {
+			mcAddOns, err := getManagedClusterAddOns(ctx)
+			if err != nil {
+				errs = append(errs, field.InternalError(field.NewPath("hubAddOn"), err))
+				return errs
+			}
+			var inUseHubAddOns []string
+			for _, removedHubAddOn := range removedHubAddOns {
+				if isAddondEnabled(mcAddOns, removedHubAddOn) {
+					inUseHubAddOns = append(inUseHubAddOns, removedHubAddOn)
+				}
+			}
+			if len(inUseHubAddOns) > 0 {
+				errs = append(errs, field.Invalid(field.NewPath("hubAddOn"), inUseHubAddOns,
+					fmt.Sprintf("cannot remove hubAddOns %v as they are still in use by managedclusteraddons", inUseHubAddOns)))
+			}
+
 		}
 	}
 
@@ -192,10 +258,10 @@ func getManagedClusterAddOns(ctx context.Context) ([]addonv1alpha1.ManagedCluste
 }
 
 // isAddonConfigInUse checks if a removed addon config is still referenced by any ManagedClusterAddOn.
-func isAddonConfigInUse(mcAddOns []addonv1alpha1.ManagedClusterAddOn, removedConfig string) bool {
+func isAddondEnabled(mcAddOns []addonv1alpha1.ManagedClusterAddOn, removedAddon string) bool {
 	for _, mcao := range mcAddOns {
 		for _, cr := range mcao.Status.ConfigReferences {
-			if cr.DesiredConfig.Name == removedConfig {
+			if cr.DesiredConfig.Name == removedAddon {
 				return true
 			}
 		}
