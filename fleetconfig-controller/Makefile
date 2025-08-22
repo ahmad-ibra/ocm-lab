@@ -83,9 +83,8 @@ helm-doc-gen: helmdoc ## Generate helm chart README.md
 	readme-generator -v charts/fleetconfig-controller/values.yaml -r charts/fleetconfig-controller/README.md
 
 .PHONY: manifests
-manifests: kustomize controller-gen ## Generate CustomResourceDefinition and WebhookConfiguration objects.
-	$(CONTROLLER_GEN) rbac:roleName=manager-role crd webhook paths="./..." output:crd:artifacts:config=config/crd/bases
-	$(KUSTOMIZE) build config/crd -o charts/fleetconfig-controller/crds/fleetconfig.open-cluster-management.io-crds.yaml
+manifests: controller-gen ## Generate CustomResourceDefinition and WebhookConfiguration objects.
+	$(CONTROLLER_GEN) webhook crd paths="./..." output:crd:artifacts:config=charts/fleetconfig-controller/crds
 	./hack/install_crds.sh
 
 ##@ Testing Targets
@@ -142,9 +141,9 @@ ifndef ignore-not-found
 endif
 
 .PHONY: install-crds
-install-crds: manifests kustomize ## Install CRDs.
-	$(KUSTOMIZE) build config/crd | $(KUBECTL) apply -f -
+install-crds: manifests ## Install CRDs.
+	find charts/fleetconfig-controller/crds/ -name "fleetconfig.open-cluster-management.*.yaml" -exec $(KUBECTL) apply -f {} \;
 
 .PHONY: uninstall-crds
-uninstall-crds: manifests kustomize ## Uninstall CRDs. Call with ignore-not-found=true to ignore resource not found errors during deletion.
-	$(KUSTOMIZE) build config/crd | $(KUBECTL) delete --ignore-not-found=$(ignore-not-found) -f -
+uninstall-crds: manifests ## Uninstall CRDs. Call with ignore-not-found=true to ignore resource not found errors during deletion.
+	find charts/fleetconfig-controller/crds/ -name "fleetconfig.open-cluster-management.*.yaml" -exec $(KUBECTL) delete --ignore-not-found=$(ignore-not-found) -f {} \;
