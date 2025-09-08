@@ -35,22 +35,23 @@ const (
 	hubAddon  = "hub-addon"
 )
 
-func handleAddonConfig(ctx context.Context, kClient client.Client, addonC *addonapi.Clientset, fc *v1alpha1.FleetConfig) error {
+func handleAddonConfig(ctx context.Context, kClient client.Client, addonC *addonapi.Clientset, fc *v1alpha1.FleetConfig) (bool, error) {
 	logger := log.FromContext(ctx)
 	logger.V(0).Info("handleAddOnConfig", "fleetconfig", fc.Name)
+
+	requestedAddOns := fc.Spec.AddOnConfigs
 
 	// get existing addons
 	createdAddOns, err := addonC.AddonV1alpha1().AddOnTemplates().List(ctx, metav1.ListOptions{LabelSelector: v1alpha1.ManagedBySelector.String()})
 	if err != nil {
-		return err
+		logger.V(1).Info("failed to list AddOnTemplates, ensure CRDs are installed.", "error", err)
+		return len(requestedAddOns) > 0, err
 	}
-
-	requestedAddOns := fc.Spec.AddOnConfigs
 
 	// nothing to do
 	if len(requestedAddOns) == 0 && len(createdAddOns.Items) == 0 {
 		logger.V(5).Info("no addons to reconcile")
-		return nil
+		return false, nil
 	}
 
 	// compare existing to requested
@@ -83,15 +84,15 @@ func handleAddonConfig(ctx context.Context, kClient client.Client, addonC *addon
 	// do deletes first, then creates.
 	err = handleAddonDelete(ctx, addonC, fc, addonsToDelete)
 	if err != nil {
-		return err
+		return true, err
 	}
 
 	err = handleAddonCreate(ctx, kClient, fc, addonsToCreate)
 	if err != nil {
-		return err
+		return true, err
 	}
 
-	return nil
+	return true, nil
 }
 
 func handleAddonCreate(ctx context.Context, kClient client.Client, fc *v1alpha1.FleetConfig, addons []v1alpha1.AddOnConfig) error {
@@ -408,7 +409,7 @@ func isHubAddOnMatching(installed v1alpha1.InstalledHubAddOn, desired v1alpha1.H
 		installed.BundleVersion == bundleVersion
 }
 
-func handleHubAddons(ctx context.Context, addonC *addonapi.Clientset, fc *v1alpha1.FleetConfig) error {
+func handleHubAddons(ctx context.Context, addonC *addonapi.Clientset, fc *v1alpha1.FleetConfig) (bool, error) {
 	logger := log.FromContext(ctx)
 	logger.V(0).Info("handleHubAddons", "fleetconfig", fc.Name)
 
@@ -419,7 +420,7 @@ func handleHubAddons(ctx context.Context, addonC *addonapi.Clientset, fc *v1alph
 	// nothing to do
 	if len(desiredAddOns) == 0 && len(installedAddOns) == 0 {
 		logger.V(5).Info("no hub addons to reconcile")
-		return nil
+		return false, nil
 	}
 
 	// Find addons that need to be uninstalled (present in installed, missing from desired or version mismatch)
@@ -447,12 +448,12 @@ func handleHubAddons(ctx context.Context, addonC *addonapi.Clientset, fc *v1alph
 	// do uninstalls first, then installs
 	err := handleHubAddonUninstall(ctx, addonsToUninstall, fc)
 	if err != nil {
-		return err
+		return true, err
 	}
 
 	err = handleHubAddonInstall(ctx, addonC, addonsToInstall, bundleVersion, fc)
 	if err != nil {
-		return err
+		return true, err
 	}
 
 	// build the new installed addons list
@@ -465,7 +466,7 @@ func handleHubAddons(ctx context.Context, addonC *addonapi.Clientset, fc *v1alph
 		})
 	}
 	fc.Status.InstalledHubAddOns = newInstalledAddOns
-	return nil
+	return true, nil
 }
 
 func handleHubAddonUninstall(ctx context.Context, addons []v1alpha1.InstalledHubAddOn, fc *v1alpha1.FleetConfig) error {
