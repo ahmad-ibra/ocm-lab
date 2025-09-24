@@ -3,7 +3,7 @@ name: Planner
 on:
   pull_request:
   pull_request_target:
-    types: [unlabeled]
+    types: [opened, labeled, unlabeled, reopened, synchronize, ready_for_review]
   workflow_dispatch:
 
 concurrency:
@@ -92,6 +92,50 @@ jobs:
 
         echo "Matrix: $matrixJson"
         echo "Artifacts: $artifacts_json"
+        
+  extract-label-filter:
+    name: extract-label-filter
+    needs: generate-matrix
+    runs-on: ubuntu-latest
+    outputs:
+      ginkgoLabelFilter: ${{ steps.extract-label-filter.outputs.ginkgoLabelFilter }}
+    steps:
+    - name: Extract label filter
+      id: extract-label-filter
+      run: |
+        set -e
+        # Find labels that start with 'ginkgo-filter:'
+        LABELS="${{ join(github.event.pull_request.labels.*.name, ',') }}"
+
+        # Array to collect all filters
+        FILTERS=()
+
+        # Extract all ginkgo filters
+        for label in $(echo $LABELS | tr ',' '\n'); do
+          if [[ $label == ginkgo-filter:* ]]; then
+            # Extract the filter part after the prefix
+            FILTER="${label#ginkgo-filter:}"
+            echo "Found Ginkgo filter in label: $FILTER"
+            FILTERS+=("$FILTER")
+          fi
+        done
+
+        # If we have filters, combine them with OR operator
+        if [ ${#FILTERS[@]} -gt 0 ]; then
+          COMBINED_FILTER=""
+
+          # OR each filter
+          for i in "${!FILTERS[@]}"; do
+            if [ $i -eq 0 ]; then
+              COMBINED_FILTER="(${FILTERS[$i]})"
+            else
+              COMBINED_FILTER="$COMBINED_FILTER||(${FILTERS[$i]})"
+            fi
+          done
+
+          echo "Final ginkgo label filter: $COMBINED_FILTER"
+          echo "ginkgoLabelFilter=$COMBINED_FILTER" >> $GITHUB_OUTPUT
+        fi
 
   call-test:
     name: test
@@ -108,7 +152,9 @@ jobs:
 
   call-e2e:
     name: e2e
-    needs: generate-matrix
+    needs: 
+      - generate-matrix
+      - extract-label-filter
     if: |
       needs.generate-matrix.outputs.matrix != ''
     strategy:
@@ -118,4 +164,5 @@ jobs:
     with:
       repo: ${{ matrix.repo }}
       artifacts: ${{ fromJson(needs.generate-matrix.outputs.artifacts)[matrix.repo] }}
+      ginkgoLabelFilter: ${{ needs.extract-label-filter.outputs.ginkgoLabelFilter }}
     secrets: inherit

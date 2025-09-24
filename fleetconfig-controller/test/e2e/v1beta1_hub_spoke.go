@@ -30,24 +30,38 @@ import (
 	ktypes "k8s.io/apimachinery/pkg/types"
 	operatorv1 "open-cluster-management.io/api/operator/v1"
 
-	"github.com/open-cluster-management-io/lab/fleetconfig-controller/api/v1alpha1"
+	"github.com/open-cluster-management-io/lab/fleetconfig-controller/api/v1beta1"
 	"github.com/open-cluster-management-io/lab/fleetconfig-controller/pkg/common"
 	"github.com/open-cluster-management-io/lab/fleetconfig-controller/test/utils"
 )
 
-var _ = Describe("fleetconfig", Label("fleetconfig"), Ordered, func() {
+var _ = Describe("hub and spoke", Label("v1beta1"), Serial, Ordered, func() {
 
 	var (
-		tc      *E2EContext
-		fc      = &v1alpha1.FleetConfig{}
-		fcClone = &v1alpha1.FleetConfig{}
+		tc       *E2EContext
+		hub      = &v1beta1.Hub{}
+		hubClone = &v1beta1.Hub{}
+		spoke    = &v1beta1.Spoke{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      v1beta1spokeNN.Name,
+				Namespace: v1beta1spokeNN.Namespace,
+			},
+		}
+		hubAsSpoke = &v1beta1.Spoke{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      v1beta1hubAsSpokeNN.Name,
+				Namespace: v1beta1hubAsSpokeNN.Namespace,
+			},
+		}
+		spokeClone      = &v1beta1.Spoke{}
+		hubAsSpokeClone = &v1beta1.Spoke{}
 	)
 
 	BeforeAll(func() {
 		tc = setupTestEnvironment()
 
 		By("deploying fleetconfig")
-		Expect(utils.DevspaceRunPipeline(tc.ctx, tc.hubKubeconfig, "deploy-local", fcNamespace)).To(Succeed())
+		Expect(utils.DevspaceRunPipeline(tc.ctx, tc.hubKubeconfig, "deploy-local", fcNamespace, "v1beta1")).To(Succeed())
 	})
 
 	AfterAll(func() {
@@ -62,16 +76,20 @@ var _ = Describe("fleetconfig", Label("fleetconfig"), Ordered, func() {
 	// 5. Addon update and propagation
 	// 6. Spoke removal with proper deregistration from hub
 	// 7. ManagedCluster and namespace deletion validation
-	// 8. Automatic ManifestWork cleanup when FleetConfig resource is deleted
-	Context("deploy and teardown FleetConfig with ResourceCleanup feature gate enabled", func() {
+	// 8. Automatic ManifestWork cleanup when Hub and Spoke resource are deleted
+	Context("deploy and teardown Hub and Spokes with ResourceCleanup feature gate enabled", func() {
 
 		It("should join the spoke and hub-as-spoke clusters to the hub", func() {
 			// NOTE: The FleetConfig CR is created by devspace when the fleetconfig-controller chart is installed.
 			//       Its configuration is defined via the fleetConfig values.
-			ensureFleetConfigProvisioned(tc, fc, nil)
+			ensureHubAndSpokesProvisioned(tc, hub, []*v1beta1.Spoke{spoke, hubAsSpoke}, nil)
 
-			By("cloning the FleetConfig resource for further scenarios")
-			err := utils.CloneFleetConfig(fc, fcClone)
+			By("cloning the FleetConfig resources for further scenarios")
+			err := utils.CloneHub(hub, hubClone)
+			Expect(err).NotTo(HaveOccurred())
+			err = utils.CloneSpoke(spoke, spokeClone)
+			Expect(err).NotTo(HaveOccurred())
+			err = utils.CloneSpoke(hubAsSpoke, hubAsSpokeClone)
 			Expect(err).NotTo(HaveOccurred())
 		})
 
@@ -110,31 +128,34 @@ var _ = Describe("fleetconfig", Label("fleetconfig"), Ordered, func() {
 
 		It("should not allow changes to the FleetConfig resource", func() {
 
-			By("failing to patch the FleetConfig's feature gates")
-			fc, err := utils.GetFleetConfig(tc.ctx, tc.kClient, fleetConfigNN)
+			By("failing to patch the Hub's feature gates")
+			hub, err := utils.GetHub(tc.ctx, tc.kClient, v1beta1hubNN)
 			Expect(err).NotTo(HaveOccurred())
 			patchFeatureGates := "DefaultClusterSet=true,ManifestWorkReplicaSet=true,ResourceCleanup=false"
-			Expect(utils.UpdateFleetConfigFeatureGates(tc.ctx, tc.kClient, fc, patchFeatureGates)).ToNot(Succeed())
+			Expect(utils.UpdateHubFeatureGates(tc.ctx, tc.kClient, hub, patchFeatureGates)).ToNot(Succeed())
 		})
 
 		It("should update an addon and make sure its propagated to the spoke", func() {
-			updateAddon(tc, fc)
+			updateHubAddon(tc, hub)
 			ensureAddonCreated(tc, 1)
 		})
 
-		It("should remove a spoke from the hub", func() {
-			removeSpokeFromHub(tc, fc)
+		It("should delete a Spoke", func() {
+			err := tc.kClient.Delete(tc.ctx, spoke)
+			Expect(err).NotTo(HaveOccurred())
 		})
 
 		It("should clean up the hub cluster", func() {
 
 			By("ensuring the spoke is deregistered properly")
 			EventuallyWithOffset(1, func() error {
-				if err := tc.kClient.Get(tc.ctx, fleetConfigNN, fc); err != nil {
-					return err
+				By("ensuring the Spoke resource is deleted")
+				err := tc.kClient.Get(tc.ctx, v1beta1spokeNN, spoke)
+				if err == nil {
+					return errors.New("spoke still exists")
 				}
-				if len(fc.Status.JoinedSpokes) > 1 {
-					return errors.New("spoke has not been unjoined")
+				if err != nil && !kerrs.IsNotFound(err) {
+					return err
 				}
 
 				kcfg, err := os.ReadFile(tc.hubKubeconfig)
@@ -172,55 +193,31 @@ var _ = Describe("fleetconfig", Label("fleetconfig"), Ordered, func() {
 					utils.WarnError(err, "ManagedCluster namespace still exists")
 					return err
 				}
-
-				By("ensuring the FleetConfig is in the expected state")
-				conditions := make([]metav1.Condition, len(fc.Status.Conditions))
-				for i, c := range fc.Status.Conditions {
-					conditions[i] = c.Condition
-				}
-				if err = utils.AssertConditions(conditions, map[string]metav1.ConditionStatus{
-					v1alpha1.FleetConfigHubInitialized:                         metav1.ConditionTrue,
-					v1alpha1.FleetConfigCleanupFailed:                          metav1.ConditionFalse,
-					v1alpha1.FleetConfigAddonsConfigured:                       metav1.ConditionTrue,
-					fmt.Sprintf("spoke-cluster-%s-joined", hubAsSpokeName):     metav1.ConditionTrue,
-					fmt.Sprintf("spoke-cluster-%s-joined", spokeName):          metav1.ConditionTrue,
-					fmt.Sprintf("spoke-cluster-%s-addons-enabled", spokeName):  metav1.ConditionTrue,
-					fmt.Sprintf("spoke-cluster-%s-unjoined", spokeName):        metav1.ConditionTrue,
-					fmt.Sprintf("spoke-cluster-%s-addons-disabled", spokeName): metav1.ConditionTrue,
-				}); err != nil {
-					utils.WarnError(err, "Spoke does not have expected condition")
-					return err
-				}
 				return nil
-			}, 5*time.Minute, 10*time.Second).Should(Succeed())
+			})
 
-			By("deleting the FleetConfig and ensuring that it isn't deleted until the ManifestWork is deleted")
-			ExpectWithOffset(1, tc.kClient.Delete(tc.ctx, fcClone)).To(Succeed())
+			By("deleting the Hub and ensuring that it isn't deleted until the ManifestWork is deleted")
+			ExpectWithOffset(1, tc.kClient.Delete(tc.ctx, hubClone)).To(Succeed())
 			EventuallyWithOffset(1, func() error {
-				if err := tc.kClient.Get(tc.ctx, fleetConfigNN, fcClone); err != nil {
+				if err := tc.kClient.Get(tc.ctx, v1beta1hubNN, hubClone); err != nil {
 					utils.WarnError(err, "failed to get FleetConfig")
 					return err
 				}
-				if fcClone.Status.Phase != v1alpha1.FleetConfigDeleting {
-					err := fmt.Errorf("expected %s, got %s", v1alpha1.FleetConfigDeleting, fcClone.Status.Phase)
+				if hubClone.Status.Phase != v1beta1.Deleting {
+					err := fmt.Errorf("expected %s, got %s", v1beta1.Deleting, hubClone.Status.Phase)
 					utils.WarnError(err, "FleetConfig deletion not started")
 					return err
 				}
-				conditions := make([]metav1.Condition, len(fcClone.Status.Conditions))
-				for i, c := range fcClone.Status.Conditions {
+				conditions := make([]metav1.Condition, len(hubClone.Status.Conditions))
+				for i, c := range hubClone.Status.Conditions {
 					conditions[i] = c.Condition
 				}
 				if err := utils.AssertConditions(conditions, map[string]metav1.ConditionStatus{
-					v1alpha1.FleetConfigHubInitialized:                         metav1.ConditionTrue,
-					v1alpha1.FleetConfigCleanupFailed:                          metav1.ConditionTrue,
-					v1alpha1.FleetConfigAddonsConfigured:                       metav1.ConditionTrue,
-					fmt.Sprintf("spoke-cluster-%s-joined", hubAsSpokeName):     metav1.ConditionTrue,
-					fmt.Sprintf("spoke-cluster-%s-joined", spokeName):          metav1.ConditionTrue,
-					fmt.Sprintf("spoke-cluster-%s-addons-enabled", spokeName):  metav1.ConditionTrue,
-					fmt.Sprintf("spoke-cluster-%s-unjoined", spokeName):        metav1.ConditionTrue,
-					fmt.Sprintf("spoke-cluster-%s-addons-disabled", spokeName): metav1.ConditionTrue,
+					v1beta1.HubInitialized:   metav1.ConditionTrue,
+					v1beta1.CleanupFailed:    metav1.ConditionTrue,
+					v1beta1.AddonsConfigured: metav1.ConditionTrue,
 				}); err != nil {
-					utils.WarnError(err, "FleetConfig deletion not blocked")
+					utils.WarnError(err, "Hub deletion not blocked")
 					return err
 				}
 				return nil
@@ -229,17 +226,29 @@ var _ = Describe("fleetconfig", Label("fleetconfig"), Ordered, func() {
 			By("deleting the manifest work from the hub")
 			ExpectWithOffset(1, deleteManifestWork(tc.ctx, hubAsSpokeName)).To(Succeed())
 
-			By("ensuring the FleetConfig is deleted once the ManifestWork is deleted")
+			By("ensuring the Hub and hub-as-spoke Spoke are deleted once the ManifestWork is deleted")
 			ensureResourceDeleted(
 				func() error {
-					err := tc.kClient.Get(tc.ctx, fleetConfigNN, fcClone)
+					err := tc.kClient.Get(tc.ctx, v1beta1hubAsSpokeNN, hubAsSpokeClone)
 					if kerrs.IsNotFound(err) {
-						utils.Info("FleetConfig deleted successfully")
+						utils.Info("Spoke deleted successfully")
 						return nil
 					} else if err != nil {
-						utils.WarnError(err, "failed to check if FleetConfig was deleted")
+						utils.WarnError(err, "failed to check if Spoke was deleted")
 					}
-					return errors.New("FleetConfig still exists")
+					return errors.New("spoke still exists")
+				},
+			)
+			ensureResourceDeleted(
+				func() error {
+					err := tc.kClient.Get(tc.ctx, v1beta1hubNN, hubClone)
+					if kerrs.IsNotFound(err) {
+						utils.Info("Hub deleted successfully")
+						return nil
+					} else if err != nil {
+						utils.WarnError(err, "failed to check if Hub was deleted")
+					}
+					return errors.New("hub still exists")
 				},
 			)
 		})

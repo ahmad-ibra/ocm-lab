@@ -34,6 +34,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	"github.com/open-cluster-management-io/lab/fleetconfig-controller/api/v1alpha1"
+	"github.com/open-cluster-management-io/lab/fleetconfig-controller/api/v1beta1"
 )
 
 const (
@@ -74,7 +75,7 @@ func WarnError(err error, format string, a ...any) {
 }
 
 // DevspaceRunPipeline runs a devspace pipeline
-func DevspaceRunPipeline(ctx context.Context, kubeconfig, pipeline, namespace string) error {
+func DevspaceRunPipeline(ctx context.Context, kubeconfig, pipeline, namespace, profile string) error {
 	projDir, err := GetProjectDir()
 	if err != nil {
 		return fmt.Errorf("failed to get project directory: %v", err)
@@ -84,6 +85,7 @@ func DevspaceRunPipeline(ctx context.Context, kubeconfig, pipeline, namespace st
 		"devspace", "run-pipeline", pipeline,
 		"--kubeconfig", kubeconfig,
 		"--namespace", namespace,
+		"--profile", profile,
 		"--no-warn", "--force-build",
 		// "--debug",
 	)
@@ -291,6 +293,42 @@ func UpdateFleetConfigFeatureGates(ctx context.Context, kClient client.Client, f
 	return PatchFleetConfig(ctx, kClient, original, fc)
 }
 
+// GetHub gets a Hub
+func GetHub(ctx context.Context, kClient client.Client, nn ktypes.NamespacedName) (*v1beta1.Hub, error) {
+	hub := &v1beta1.Hub{}
+	return hub, kClient.Get(ctx, nn, hub)
+}
+
+// PatchHub patches a Hub
+func PatchHub(ctx context.Context, kClient client.Client, original *v1beta1.Hub, patch *v1beta1.Hub) error {
+	patchObject := client.MergeFrom(original)
+	return kClient.Patch(ctx, patch, patchObject)
+}
+
+// UpdateHubFeatureGates updates a Hub's feature gates
+func UpdateHubFeatureGates(ctx context.Context, kClient client.Client, hub *v1beta1.Hub, featureGates string) error {
+	if hub.Spec.ClusterManager == nil {
+		return fmt.Errorf("ClusterManager is nil")
+	}
+
+	original := hub.DeepCopy()
+	hub.Spec.ClusterManager.FeatureGates = featureGates
+
+	return PatchHub(ctx, kClient, original, hub)
+}
+
+// GetSpoke gets a Spoke
+func GetSpoke(ctx context.Context, kClient client.Client, nn ktypes.NamespacedName) (*v1beta1.Spoke, error) {
+	spoke := &v1beta1.Spoke{}
+	return spoke, kClient.Get(ctx, nn, spoke)
+}
+
+// PatchSpoke patches a Spoke
+func PatchSpoke(ctx context.Context, kClient client.Client, original *v1beta1.Spoke, patch *v1beta1.Spoke) error {
+	patchObject := client.MergeFrom(original)
+	return kClient.Patch(ctx, patch, patchObject)
+}
+
 // CloneFleetConfig clones a FleetConfig
 func CloneFleetConfig(fc *v1alpha1.FleetConfig, dest *v1alpha1.FleetConfig) error {
 	*dest = v1alpha1.FleetConfig{
@@ -299,6 +337,30 @@ func CloneFleetConfig(fc *v1alpha1.FleetConfig, dest *v1alpha1.FleetConfig) erro
 			Namespace: fc.Namespace,
 		},
 		Spec: *fc.Spec.DeepCopy(),
+	}
+	return nil
+}
+
+// CloneHub clones a Hub
+func CloneHub(hub *v1beta1.Hub, dest *v1beta1.Hub) error {
+	*dest = v1beta1.Hub{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      hub.Name,
+			Namespace: hub.Namespace,
+		},
+		Spec: *hub.Spec.DeepCopy(),
+	}
+	return nil
+}
+
+// CloneSpoke clones a Spoke
+func CloneSpoke(spoke *v1beta1.Spoke, dest *v1beta1.Spoke) error {
+	*dest = v1beta1.Spoke{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      spoke.Name,
+			Namespace: spoke.Namespace,
+		},
+		Spec: *spoke.Spec.DeepCopy(),
 	}
 	return nil
 }

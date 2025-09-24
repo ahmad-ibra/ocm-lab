@@ -21,6 +21,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	"github.com/open-cluster-management-io/lab/fleetconfig-controller/api/v1alpha1"
+	"github.com/open-cluster-management-io/lab/fleetconfig-controller/internal/args"
 	exec_utils "github.com/open-cluster-management-io/lab/fleetconfig-controller/internal/exec"
 	"github.com/open-cluster-management-io/lab/fleetconfig-controller/internal/file"
 	"github.com/open-cluster-management-io/lab/fleetconfig-controller/internal/kube"
@@ -34,7 +35,7 @@ func handleHub(ctx context.Context, kClient client.Client, fc *v1alpha1.FleetCon
 	logger.V(0).Info("handleHub", "fleetconfig", fc.Name)
 
 	// check if the hub is already initialized
-	hubKubeconfig, err := kube.KubeconfigFromSecretOrCluster(ctx, kClient, fc.Spec.Hub.Kubeconfig)
+	hubKubeconfig, err := kube.KubeconfigFromNamespacedSecretOrCluster(ctx, kClient, fc.Spec.Hub.Kubeconfig)
 	if err != nil {
 		return err
 	}
@@ -77,7 +78,7 @@ func handleHub(ctx context.Context, kClient client.Client, fc *v1alpha1.FleetCon
 			return errors.New(msg)
 		}
 	} else {
-		if err := initializeHub(ctx, kClient, fc); err != nil {
+		if err := initializeHub(ctx, fc, hubKubeconfig); err != nil {
 			return err
 		}
 	}
@@ -122,7 +123,7 @@ func handleHub(ctx context.Context, kClient client.Client, fc *v1alpha1.FleetCon
 }
 
 // initializeHub initializes the Hub cluster via 'clusteradm init'
-func initializeHub(ctx context.Context, kClient client.Client, fc *v1alpha1.FleetConfig) error {
+func initializeHub(ctx context.Context, fc *v1alpha1.FleetConfig, hubKubeconfig []byte) error {
 	logger := log.FromContext(ctx)
 	logger.V(0).Info("initHub", "fleetconfig", fc.Name)
 
@@ -181,13 +182,13 @@ func initializeHub(ctx context.Context, kClient client.Client, fc *v1alpha1.Flee
 		initArgs = append(initArgs, "--bundle-version", fc.Spec.Hub.ClusterManager.Source.BundleVersion)
 		initArgs = append(initArgs, "--image-registry", fc.Spec.Hub.ClusterManager.Source.Registry)
 		// resources args
-		initArgs = append(initArgs, common.PrepareResources(fc.Spec.Hub.ClusterManager.Resources)...)
+		initArgs = append(initArgs, args.PrepareResources(fc.Spec.Hub.ClusterManager.Resources)...)
 	} else {
 		// one of clusterManager or singletonControlPlane must be specified, per validating webhook, but handle the edge case anyway
 		return fmt.Errorf("unknown hub type, must specify either hub.clusterManager or hub.singletonControlPlane")
 	}
 
-	initArgs, cleanupKcfg, err := common.PrepareKubeconfig(ctx, kClient, fc.Spec.Hub.Kubeconfig, initArgs)
+	initArgs, cleanupKcfg, err := args.PrepareKubeconfig(ctx, hubKubeconfig, fc.Spec.Hub.Kubeconfig.Context, initArgs)
 	if cleanupKcfg != nil {
 		defer cleanupKcfg()
 	}

@@ -14,10 +14,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	"github.com/open-cluster-management-io/lab/fleetconfig-controller/api/v1alpha1"
-)
-
-var (
-	defaultKubeconfigKey = "kubeconfig"
+	"github.com/open-cluster-management-io/lab/fleetconfig-controller/api/v1beta1"
 )
 
 // RestConfigFromKubeconfig either creates a rest.Config from a v1alpha1.Kubeconfig or
@@ -83,34 +80,59 @@ func RawFromInClusterRestConfig() ([]byte, error) {
 	return RawFromRestConfig(rc)
 }
 
-// KubeconfigFromSecretOrCluster loads a kubeconfig from a secret or generates one from inCluster
-func KubeconfigFromSecretOrCluster(ctx context.Context, kClient client.Client, kubeconfig v1alpha1.Kubeconfig) (raw []byte, err error) {
+// KubeconfigFromNamespacedSecretOrCluster loads a kubeconfig from a cross-namespace secret or generates one from inCluster
+func KubeconfigFromNamespacedSecretOrCluster(ctx context.Context, kClient client.Client, kubeconfig v1alpha1.Kubeconfig) (raw []byte, err error) {
 	// exactly 1 of these 2 cases is always true
-	switch {
-	case kubeconfig.InCluster:
-		raw, err = RawFromInClusterRestConfig()
-	case kubeconfig.SecretReference != nil:
-		raw, err = KubeconfigFromSecret(ctx, kClient, kubeconfig)
+	if kubeconfig.InCluster {
+		return RawFromInClusterRestConfig()
 	}
-	return raw, err
+	return KubeconfigFromNamespacedSecret(ctx, kClient, kubeconfig)
 }
 
-// KubeconfigFromSecret loads a kubeconfig from a secret in the cluster
-func KubeconfigFromSecret(ctx context.Context, kClient client.Client, kubeconfig v1alpha1.Kubeconfig) ([]byte, error) {
+// KubeconfigFromNamespacedSecret loads a kubeconfig from a cross-namespace secret in the cluster
+func KubeconfigFromNamespacedSecret(ctx context.Context, kClient client.Client, kubeconfig v1alpha1.Kubeconfig) ([]byte, error) {
 	secretRef := kubeconfig.SecretReference
 	secret := corev1.Secret{}
-	nn := types.NamespacedName{Name: secretRef.Name, Namespace: secretRef.Namespace}
+	nn := types.NamespacedName{
+		Name:      secretRef.Name,
+		Namespace: secretRef.Namespace,
+	}
 	if err := kClient.Get(ctx, nn, &secret); err != nil {
 		return nil, err
 	}
 
-	kubeconfigKey := defaultKubeconfigKey
-	if secretRef.KubeconfigKey != "" {
-		kubeconfigKey = secretRef.KubeconfigKey
-	}
-	raw, ok := secret.Data[kubeconfigKey]
+	raw, ok := secret.Data[secretRef.KubeconfigKey]
 	if !ok {
-		return nil, fmt.Errorf("kubeconfig key '%s' not found in %s/%s secret", kubeconfigKey, secretRef.Namespace, secretRef.Name)
+		return nil, fmt.Errorf("kubeconfig key '%s' not found in %v secret", secretRef.KubeconfigKey, nn)
+	}
+
+	return raw, nil
+}
+
+// KubeconfigFromSecretOrCluster loads a kubeconfig from a secret or generates one from inCluster
+func KubeconfigFromSecretOrCluster(ctx context.Context, kClient client.Client, kubeconfig v1beta1.Kubeconfig, namespace string) (raw []byte, err error) {
+	// exactly 1 of these 2 cases is always true
+	if kubeconfig.InCluster {
+		return RawFromInClusterRestConfig()
+	}
+	return KubeconfigFromSecret(ctx, kClient, kubeconfig, namespace)
+}
+
+// KubeconfigFromSecret loads a kubeconfig from a secret in the cluster
+func KubeconfigFromSecret(ctx context.Context, kClient client.Client, kubeconfig v1beta1.Kubeconfig, namespace string) ([]byte, error) {
+	secretRef := kubeconfig.SecretReference
+	secret := corev1.Secret{}
+	nn := types.NamespacedName{
+		Name:      secretRef.Name,
+		Namespace: namespace,
+	}
+	if err := kClient.Get(ctx, nn, &secret); err != nil {
+		return nil, err
+	}
+
+	raw, ok := secret.Data[secretRef.KubeconfigKey]
+	if !ok {
+		return nil, fmt.Errorf("kubeconfig key '%s' not found in %v secret", secretRef.KubeconfigKey, nn)
 	}
 
 	return raw, nil

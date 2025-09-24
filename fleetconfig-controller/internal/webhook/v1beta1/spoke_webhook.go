@@ -14,22 +14,26 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-// TODO - remove once spoke webhooks are implemented.
-//
-//nolint:all // Required because of `dupl` between this file and spoke_webhook.go
 package v1beta1
 
 import (
 	"context"
 	"fmt"
 
+	kerrs "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/util/validation/field"
+	"open-cluster-management.io/api/client/addon/clientset/versioned"
+	operatorv1 "open-cluster-management.io/api/operator/v1"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/webhook"
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 
-	fleetconfigopenclustermanagementiov1beta1 "github.com/open-cluster-management-io/lab/fleetconfig-controller/api/v1beta1"
+	"github.com/open-cluster-management-io/lab/fleetconfig-controller/api/v1beta1"
+	"github.com/open-cluster-management-io/lab/fleetconfig-controller/internal/kube"
+	"github.com/open-cluster-management-io/lab/fleetconfig-controller/pkg/common"
 )
 
 // nolint:unused
@@ -38,42 +42,19 @@ var spokelog = logf.Log.WithName("spoke-resource")
 
 // SetupSpokeWebhookWithManager registers the webhook for Spoke in the manager.
 func SetupSpokeWebhookWithManager(mgr ctrl.Manager) error {
-	return ctrl.NewWebhookManagedBy(mgr).For(&fleetconfigopenclustermanagementiov1beta1.Spoke{}).
-		WithValidator(&SpokeCustomValidator{}).
-		WithDefaulter(&SpokeCustomDefaulter{}).
+	kubeconfig, err := kube.RawFromInClusterRestConfig()
+	if err != nil {
+		return err
+	}
+	addonC, err := common.AddOnClient(kubeconfig)
+	if err != nil {
+		return err
+	}
+	return ctrl.NewWebhookManagedBy(mgr).For(&v1beta1.Spoke{}).
+		WithValidator(&SpokeCustomValidator{client: mgr.GetClient(), addonC: addonC}).
 		Complete()
 }
 
-// TODO(user): EDIT THIS FILE!  THIS IS SCAFFOLDING FOR YOU TO OWN!
-
-// +kubebuilder:webhook:path=/mutate-fleetconfig-open-cluster-management-io-v1beta1-spoke,mutating=true,failurePolicy=fail,sideEffects=None,groups=fleetconfig.open-cluster-management.io,resources=spokes,verbs=create;update,versions=v1beta1,name=mspoke-v1beta1.kb.io,admissionReviewVersions=v1
-
-// SpokeCustomDefaulter struct is responsible for setting default values on the custom resource of the
-// Kind Spoke when those are created or updated.
-//
-// NOTE: The +kubebuilder:object:generate=false marker prevents controller-gen from generating DeepCopy methods,
-// as it is used only for temporary operations and does not need to be deeply copied.
-type SpokeCustomDefaulter struct {
-	// TODO(user): Add more fields as needed for defaulting
-}
-
-var _ webhook.CustomDefaulter = &SpokeCustomDefaulter{}
-
-// Default implements webhook.CustomDefaulter so a webhook will be registered for the Kind Spoke.
-func (d *SpokeCustomDefaulter) Default(_ context.Context, obj runtime.Object) error {
-	spoke, ok := obj.(*fleetconfigopenclustermanagementiov1beta1.Spoke)
-
-	if !ok {
-		return fmt.Errorf("expected an Spoke object but got %T", obj)
-	}
-	spokelog.Info("Defaulting for Spoke", "name", spoke.GetName())
-
-	// TODO(user): fill in your defaulting logic.
-
-	return nil
-}
-
-// TODO(user): change verbs to "verbs=create;update;delete" if you want to enable deletion validation.
 // NOTE: The 'path' attribute must follow a specific pattern and should not be modified directly here.
 // Modifying the path for an invalid path can cause API server errors; failing to locate the webhook.
 // +kubebuilder:webhook:path=/validate-fleetconfig-open-cluster-management-io-v1beta1-spoke,mutating=false,failurePolicy=fail,sideEffects=None,groups=fleetconfig.open-cluster-management.io,resources=spokes,verbs=create;update,versions=v1beta1,name=vspoke-v1beta1.kb.io,admissionReviewVersions=v1
@@ -84,40 +65,90 @@ func (d *SpokeCustomDefaulter) Default(_ context.Context, obj runtime.Object) er
 // NOTE: The +kubebuilder:object:generate=false marker prevents controller-gen from generating DeepCopy methods,
 // as this struct is used only for temporary operations and does not need to be deeply copied.
 type SpokeCustomValidator struct {
-	// TODO(user): Add more fields as needed for validation
+	client client.Client
+	addonC *versioned.Clientset
 }
 
 var _ webhook.CustomValidator = &SpokeCustomValidator{}
 
 // ValidateCreate implements webhook.CustomValidator so a webhook will be registered for the type Spoke.
-func (v *SpokeCustomValidator) ValidateCreate(_ context.Context, obj runtime.Object) (admission.Warnings, error) {
-	spoke, ok := obj.(*fleetconfigopenclustermanagementiov1beta1.Spoke)
+func (v *SpokeCustomValidator) ValidateCreate(ctx context.Context, obj runtime.Object) (admission.Warnings, error) {
+	spoke, ok := obj.(*v1beta1.Spoke)
 	if !ok {
 		return nil, fmt.Errorf("expected a Spoke object but got %T", obj)
 	}
 	spokelog.Info("Validation for Spoke upon creation", "name", spoke.GetName())
 
-	// TODO(user): fill in your validation logic upon object creation.
+	var allErrs field.ErrorList
 
-	return nil, nil
+	if spoke.Spec.Klusterlet.Mode == string(operatorv1.InstallModeHosted) {
+		if spoke.Spec.Klusterlet.ManagedClusterKubeconfig.SecretReference == nil {
+			allErrs = append(allErrs, field.Invalid(
+				field.NewPath("spec").Child("klusterlet").Child("managedClusterKubeconfig").Child("secretReference"),
+				spoke.Name, "managedClusterKubeconfig.secretReference is required in hosted mode"),
+			)
+		} else {
+			if valid, msg := isKubeconfigValid(spoke.Spec.Klusterlet.ManagedClusterKubeconfig); !valid {
+				allErrs = append(allErrs, field.Invalid(
+					field.NewPath("spec").Child("klusterlet").Child("managedClusterKubeconfig").Child("secretReference"),
+					spoke.Name, msg),
+				)
+			}
+		}
+	}
+	if valid, msg := isKubeconfigValid(spoke.Spec.Kubeconfig); !valid {
+		allErrs = append(allErrs, field.Invalid(
+			field.NewPath("spec").Child("kubeconfig"), spoke, msg),
+		)
+	}
+
+	warn, errs := validateAddons(ctx, v.client, spoke, v.addonC)
+	allErrs = append(allErrs, errs...)
+
+	if len(allErrs) > 0 {
+		return warn, kerrs.NewInvalid(v1beta1.SpokeGroupKind, spoke.Name, allErrs)
+	}
+	return warn, nil
 }
 
 // ValidateUpdate implements webhook.CustomValidator so a webhook will be registered for the type Spoke.
-func (v *SpokeCustomValidator) ValidateUpdate(_ context.Context, _, newObj runtime.Object) (admission.Warnings, error) {
-	spoke, ok := newObj.(*fleetconfigopenclustermanagementiov1beta1.Spoke)
+func (v *SpokeCustomValidator) ValidateUpdate(ctx context.Context, oldObj, newObj runtime.Object) (admission.Warnings, error) {
+	spoke, ok := newObj.(*v1beta1.Spoke)
 	if !ok {
 		return nil, fmt.Errorf("expected a Spoke object for the newObj but got %T", newObj)
 	}
+	oldSpoke, ok := oldObj.(*v1beta1.Spoke)
+	if !ok {
+		return nil, fmt.Errorf("expected a Spoke object for the oldObj but got %T", oldObj)
+	}
 	spokelog.Info("Validation for Spoke upon update", "name", spoke.GetName())
 
-	// TODO(user): fill in your validation logic upon object update.
+	err := allowSpokeUpdate(oldSpoke, spoke)
+	if err != nil {
+		return nil, err
+	}
 
-	return nil, nil
+	var allErrs field.ErrorList
+
+	valid, msg := isKubeconfigValid(spoke.Spec.Kubeconfig)
+	if !valid {
+		allErrs = append(allErrs, field.Invalid(
+			field.NewPath("spec").Child("kubeconfig"), spoke, msg),
+		)
+	}
+
+	warn, valErrs := validateAddons(ctx, v.client, spoke, v.addonC)
+	allErrs = append(allErrs, valErrs...)
+
+	if len(allErrs) > 0 {
+		return warn, kerrs.NewInvalid(v1beta1.SpokeGroupKind, spoke.Name, allErrs)
+	}
+	return warn, nil
 }
 
 // ValidateDelete implements webhook.CustomValidator so a webhook will be registered for the type Spoke.
 func (v *SpokeCustomValidator) ValidateDelete(_ context.Context, obj runtime.Object) (admission.Warnings, error) {
-	spoke, ok := obj.(*fleetconfigopenclustermanagementiov1beta1.Spoke)
+	spoke, ok := obj.(*v1beta1.Spoke)
 	if !ok {
 		return nil, fmt.Errorf("expected a Spoke object but got %T", obj)
 	}

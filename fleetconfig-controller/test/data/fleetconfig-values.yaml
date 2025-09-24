@@ -1,9 +1,6 @@
 fleetConfig:
   timeout: 300
   logVerbosity: 5
-  spokeAnnotations:
-    foo: "not-bar"
-    baz: "quux"
   hub:
     addOnConfigs:
     - name: test-addon
@@ -18,17 +15,28 @@ fleetConfig:
       overwrite: false
   spokes:
   - name: hub-as-spoke
+    hubRef:
+      name: hub
+      namespace: fleetconfig-system
+    addOns:
+    - configName: test-addon
     createNamespace: true
     syncLabels: false
     kubeconfig:
       inCluster: true
     klusterlet:
+      annotations:
+        foo: "not-bar"
+        baz: "quux"
       mode: "Default"
       purgeOperator: true
       forceInternalEndpointLookup: true
       forceInternalEndpointLookupManaged: false
       singleton: false
   - name: spoke
+    hubRef:
+      name: hub
+      namespace: fleetconfig-system
     addOns:
     - configName: test-addon
     createNamespace: true
@@ -37,10 +45,10 @@ fleetConfig:
       # secret is provisioned during E2E test setup
       secretReference:
         name: "test-fleetconfig-kubeconfig"
-        namespace: "default"
         kubeconfigKey: "value"
     klusterlet:
       annotations:
+        baz: "quux"
         foo: "bar"
       mode: "Default"
       purgeOperator: true
