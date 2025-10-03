@@ -21,7 +21,11 @@ import (
 	"github.com/open-cluster-management-io/lab/fleetconfig-controller/api/v1beta1"
 )
 
-const warnHubNotFound = "hub not found, cannot validate spoke addons"
+const (
+	warnHubNotFound       = "hub not found, cannot validate spoke addons"
+	errAllowedSpokeUpdate = "spoke contains changes which are not allowed; only changes to spec.klusterlet.annotations, spec.klusterlet.values, spec.klusterlet.valuesFrom, spec.kubeconfig, spec.addOns, spec.purgeAgentNamespace, spec.cleanupConfig.purgeKubeconfigSecret, spec.timeout, and spec.logVerbosity are allowed when updating a spoke"
+	errAllowedHubUpdate   = "only changes to spec.apiServer, spec.clusterManager.source.*, spec.hubAddOns, spec.addOnConfigs, spec.logVerbosity, spec.timeout, spec.registrationAuth, and spec.kubeconfig are allowed when updating the hub"
+)
 
 func isKubeconfigValid(kubeconfig v1beta1.Kubeconfig) (bool, string) {
 	if kubeconfig.SecretReference == nil && !kubeconfig.InCluster {
@@ -85,7 +89,7 @@ func allowHubUpdate(oldHub, newHub *v1beta1.Hub) error {
 		newHubCopy.Kubeconfig = v1beta1.Kubeconfig{}
 
 		if !reflect.DeepEqual(oldHubCopy, newHubCopy) {
-			return errors.New("only changes to spec.apiServer, spec.clusterManager.source.*, spec.hubAddOns, spec.addOnConfigs, spec.logVerbosity, spec.timeout, and spec.registrationAuth are allowed when updating the hub")
+			return errors.New(errAllowedHubUpdate)
 		}
 	}
 	return nil
@@ -95,10 +99,13 @@ func allowHubUpdate(oldHub, newHub *v1beta1.Hub) error {
 // Allowed changes include:
 // - spec.klusterlet.annotations
 // - spec.klusterlet.values
+// - spec.klusterlet.valuesFrom
 // - spec.kubeconfig
 // - spec.addOns
 // - spec.timeout
 // - spec.logVerbosity
+// - spec.cleanupConfig.purgeAgentNamespace
+// - spec.cleanupConfig.purgeKubeconfigSecret
 func allowSpokeUpdate(oldSpoke, newSpoke *v1beta1.Spoke) error {
 	if !reflect.DeepEqual(newSpoke.Spec, oldSpoke.Spec) {
 		oldSpokeCopy := oldSpoke.Spec.DeepCopy()
@@ -107,6 +114,8 @@ func allowSpokeUpdate(oldSpoke, newSpoke *v1beta1.Spoke) error {
 		oldSpokeCopy.Klusterlet.Annotations = nil
 		oldSpokeCopy.Klusterlet.Values = nil
 		newSpokeCopy.Klusterlet.Values = nil
+		oldSpokeCopy.Klusterlet.ValuesFrom = nil
+		newSpokeCopy.Klusterlet.ValuesFrom = nil
 		oldSpokeCopy.Kubeconfig = v1beta1.Kubeconfig{}
 		newSpokeCopy.Kubeconfig = v1beta1.Kubeconfig{}
 		oldSpokeCopy.AddOns = []v1beta1.AddOn{}
@@ -115,9 +124,13 @@ func allowSpokeUpdate(oldSpoke, newSpoke *v1beta1.Spoke) error {
 		newSpokeCopy.LogVerbosity = 0
 		oldSpokeCopy.Timeout = 0
 		newSpokeCopy.Timeout = 0
+		oldSpokeCopy.CleanupConfig.PurgeAgentNamespace = false
+		newSpokeCopy.CleanupConfig.PurgeAgentNamespace = false
+		oldSpokeCopy.CleanupConfig.PurgeKubeconfigSecret = false
+		newSpokeCopy.CleanupConfig.PurgeKubeconfigSecret = false
 
 		if !reflect.DeepEqual(oldSpokeCopy, newSpokeCopy) {
-			return errors.New("spoke contains changes which are not allowed; only changes to spec.klusterlet.annotations, spec.klusterlet.values, spec.kubeconfig, spec.addOns, spec.timeout, and spec.logVerbosity are allowed when updating a spoke")
+			return errors.New(errAllowedSpokeUpdate)
 		}
 	}
 
@@ -147,16 +160,33 @@ func validateHubAddons(ctx context.Context, cli client.Client, oldObject, newObj
 func validateAddonUniqueness(newObject *v1beta1.Hub) field.ErrorList {
 	errs := field.ErrorList{}
 
+	for i, ha := range newObject.Spec.HubAddOns {
+		if !slices.ContainsFunc(v1beta1.SupportedHubAddons, func(a string) bool {
+			return ha.Name == a
+		}) {
+			errs = append(errs, field.Invalid(field.NewPath("hubAddOns").Index(i), ha.Name, fmt.Sprintf("invalid hubAddOn name. must be one of %v", v1beta1.SupportedHubAddons)))
+		}
+	}
+
 	// Validate that AddOnConfig names are unique within the AddOnConfigs list
-	addOnConfigNames := make(map[string]int)
+	addOnConfigVersionedNames := make(map[string]int)
 	for i, a := range newObject.Spec.AddOnConfigs {
 		key := fmt.Sprintf("%s-%s", a.Name, a.Version)
-		if existingIndex, found := addOnConfigNames[key]; found {
+		if existingIndex, found := addOnConfigVersionedNames[key]; found {
 			errs = append(errs, field.Invalid(field.NewPath("addOnConfigs").Index(i), key,
 				fmt.Sprintf("duplicate addOnConfig %s (name-version) found at indices %d and %d", key, existingIndex, i)))
 		} else {
-			addOnConfigNames[key] = i
+			addOnConfigVersionedNames[key] = i
 		}
+	}
+
+	// Build an index of AddOnConfig names (first occurrence) for cross-set clash checks with HubAddOns
+	addOnConfigNames := make(map[string]int)
+	for i, a := range newObject.Spec.AddOnConfigs {
+		if _, found := addOnConfigNames[a.Name]; found {
+			continue
+		}
+		addOnConfigNames[a.Name] = i
 	}
 
 	// Validate that HubAddOn names are unique within the HubAddOns list
@@ -340,29 +370,43 @@ func validateAddonNotInUse(ctx context.Context, removedAddons []string, fieldPat
 }
 
 // validates that any addon which is enabled on a spoke is configured
-func validateAddons(ctx context.Context, cli client.Client, newObject *v1beta1.Spoke, addonC *versioned.Clientset) (admission.Warnings, field.ErrorList) {
+func (v *SpokeCustomValidator) validateAddons(ctx context.Context, cli client.Client, newObject *v1beta1.Spoke) (admission.Warnings, field.ErrorList) {
 	errs := field.ErrorList{}
+
+	if newObject.IsHubAsSpoke() || v.instanceType == v1beta1.InstanceTypeUnified {
+		if slices.ContainsFunc(newObject.Spec.AddOns, func(a v1beta1.AddOn) bool {
+			return a.ConfigName == v1beta1.FCCAddOnName
+		}) {
+			errs = append(errs, field.Invalid(field.NewPath("spec").Child("addOns"), newObject.Spec.AddOns, "fleetconfig-controller-agent addon must not be enabled for hub-as-spoke Spokes, or when using Unified mode"))
+		}
+	} else if v.instanceType != v1beta1.InstanceTypeUnified { // fcc-agent MUST be enabled when using manager-agent (addon), MUST NOT be enabled when using unified mode
+		if !slices.ContainsFunc(newObject.Spec.AddOns, func(a v1beta1.AddOn) bool {
+			return a.ConfigName == v1beta1.FCCAddOnName
+		}) {
+			errs = append(errs, field.Invalid(field.NewPath("spec").Child("addOns"), newObject.Spec.AddOns, "Spoke must enable fleetconfig-controller-agent addon"))
+		}
+	}
 
 	// try to get hub, if not present or not ready, log a warning that addons cant be properly validated
 	hub := &v1beta1.Hub{}
 	err := cli.Get(ctx, types.NamespacedName{Name: newObject.Spec.HubRef.Name, Namespace: newObject.Spec.HubRef.Namespace}, hub)
 	if err != nil {
 		if !kerrs.IsNotFound(err) {
-			return nil, field.ErrorList{field.InternalError(field.NewPath("spec").Child("addOns"), err)}
+			errs = append(errs, field.InternalError(field.NewPath("spec").Child("addOns"), err))
+			return nil, errs
 		}
-		// warn instead of an error, so we don't block creating spokes and hub at the same time
-		return admission.Warnings{warnHubNotFound}, nil
+		return admission.Warnings{warnHubNotFound}, errs
 	}
 
 	initCond := hub.GetCondition(v1beta1.HubInitialized)
 	if initCond == nil || initCond.Status != metav1.ConditionTrue {
-		// warn instead of an error, so we don't block creating spokes and hub at the same time
-		return admission.Warnings{warnHubNotFound}, nil
+		return admission.Warnings{warnHubNotFound}, errs
 	}
 
-	cmaList, err := addonC.AddonV1alpha1().ClusterManagementAddOns().List(ctx, metav1.ListOptions{})
+	cmaList, err := v.addonC.AddonV1alpha1().ClusterManagementAddOns().List(ctx, metav1.ListOptions{})
 	if err != nil {
-		return nil, field.ErrorList{field.InternalError(field.NewPath("spec").Child("addOns"), err)}
+		errs = append(errs, field.InternalError(field.NewPath("spec").Child("addOns"), err))
+		return nil, errs
 	}
 	cmaNames := make([]string, len(cmaList.Items))
 	for i, cma := range cmaList.Items {

@@ -83,6 +83,27 @@ Generate feature gates string
 {{- end }}
 
 {{/*
+Get the Kubernetes provider
+*/}}
+{{- define "kubernetesProvider" -}}
+{{- if and .Values.global .Values.global.kubernetesProvider -}}
+{{- .Values.global.kubernetesProvider | lower -}}
+{{- else if .Values.kubernetesProvider -}}
+{{- .Values.kubernetesProvider | lower -}}
+{{- else -}}
+{{- "generic" -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
+Build the base controller image string from registry, repository, and tag.
+*/}}
+{{- define "controller.baseImage" -}}
+{{- printf "%s%s:%s" .Values.imageRegistry .Values.image.repository .Values.image.tag -}}
+{{- end -}}
+
+
+{{/*
 Format the image name and tag for the given provider.
 For managed kubernetes providers, the image tag is suffixed with the provider name.
 These images are bundled with provider-specific auth binaries.
@@ -90,13 +111,8 @@ For generic kubernetes providers, the image tag is used as is.
 This image has no additional binaries bundled, other than clusteradm.
 */}}
 {{- define "controller.image" -}}
-{{- $baseImage := printf "%s%s:%s" .Values.imageRegistry .Values.image.repository .Values.image.tag -}}
-{{- $provider := "" -}}
-{{- if and .Values.global .Values.global.kubernetesProvider -}}
-{{- $provider = .Values.global.kubernetesProvider | lower -}}
-{{- else if .Values.kubernetesProvider -}}
-{{- $provider = .Values.kubernetesProvider | lower -}}
-{{- end -}}
+{{- $baseImage := include "controller.baseImage" . -}}
+{{- $provider := include "kubernetesProvider" . -}}
 {{- if eq $provider "eks" -}}
 {{- printf "%s-%s" $baseImage $provider -}}
 {{- else if hasPrefix "gke" $provider -}}
@@ -153,5 +169,17 @@ Works with arbitrary depth and handles maps, slices, and scalar values.
   {{- end -}}
 {{- else -}}
   {}
+{{- end -}}
+{{- end -}}
+
+{{/*
+Check whether to run fleetconfig-controller in addon mode
+*/}}
+{{- define "addonMode" -}}
+{{- $provider := include "kubernetesProvider" . -}}
+{{- if eq $provider "eks" -}}
+{{- false -}}
+{{- else -}}
+{{- .Values.addonMode -}}
 {{- end -}}
 {{- end -}}

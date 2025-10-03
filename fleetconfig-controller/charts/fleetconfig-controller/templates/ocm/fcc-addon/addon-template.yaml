@@ -1,0 +1,163 @@
+# yaml-language-server: $schema=https://datreeio.github.io/CRDs-catalog/addon.open-cluster-management.io/addontemplate_v1alpha1.json
+{{- if eq (include "addonMode" .) "true" }}
+apiVersion: addon.open-cluster-management.io/v1alpha1
+kind: AddOnTemplate
+metadata:
+  name: fleetconfig-controller-agent
+spec:
+  addonName: fleetconfig-controller-agent
+  agentSpec:
+    workload:
+      manifests:
+      - kind: Deployment
+        apiVersion: apps/v1
+        metadata:
+          name: {{ include "chart.fullname" . }}-agent
+          namespace: {{ .Release.Namespace }}
+          labels:
+            control-plane: controller-manager
+          {{- include "chart.labels" . | nindent 12 }}
+        spec:
+          replicas: {{ .Values.replicas }}
+          selector:
+            matchLabels:
+              control-plane: controller-manager
+              {{- include "chart.selectorLabels" . | nindent 14 }}
+          template:
+            metadata:
+              labels:
+                control-plane: controller-manager
+                {{- include "chart.selectorLabels" . | nindent 16 }}
+              annotations:
+                kubectl.kubernetes.io/default-container: manager
+            spec:
+              {{- with .Values.imagePullSecrets }}
+              imagePullSecrets:
+              {{- toYaml . | nindent 16 }}
+              {{- end }}
+              securityContext:
+              {{- toYaml .Values.podSecurityContext | nindent 16 }}
+              serviceAccountName: {{ include "chart.fullname" . }}-agent
+              terminationGracePeriodSeconds: 10
+              containers:
+              - args:
+                - "--leader-elect"
+                - "--health-probe-bind-address=:{{ .Values.healthCheck.port }}"
+                - "--use-webhook=false"
+                - "--spoke-concurrent-reconciles=1"
+                - "--instance-type=agent"
+                command:
+                - /manager
+                env:
+                - name: KUBERNETES_CLUSTER_DOMAIN
+                  value: {{ quote .Values.kubernetesClusterDomain }}
+                - name: CLUSTER_NAMESPACE
+                  value: '{{ `{{CLUSTER_NAMESPACE}}` }}'
+                - name: HUB_NAMESPACE
+                  value: '{{ `{{HUB_NAMESPACE}}` }}'
+                - name: CONTROLLER_NAMESPACE
+                  valueFrom:
+                    fieldRef:
+                      fieldPath: metadata.namespace
+                - name: PURGE_AGENT_NAMESPACE
+                  value: '{{ `{{PURGE_AGENT_NAMESPACE}}` }}'
+                image: {{ include "controller.baseImage" . }}
+                imagePullPolicy: {{ quote .Values.image.pullPolicy }}
+                name: manager
+                resources:
+                {{- toYaml .Values.resources | nindent 18 }}
+                securityContext:
+                {{- toYaml .Values.containerSecurityContext | nindent 18 }}
+                ports:
+                - containerPort: {{ .Values.healthCheck.port }}
+                  name: healthz
+                  protocol: TCP
+                livenessProbe: {{- toYaml .Values.livenessProbe | nindent 18 }}
+                readinessProbe: {{- toYaml .Values.readinessProbe | nindent 18 }}
+      - kind: ServiceAccount
+        apiVersion: v1
+        metadata:
+          name: {{ include "chart.fullname" . }}-agent
+          namespace: {{ .Release.Namespace }}
+      - kind: ClusterRole
+        apiVersion: rbac.authorization.k8s.io/v1
+        metadata:
+          name: {{ include "chart.fullname" . }}-agent-role
+        rules:
+        - apiGroups: [""]
+          resources: ["namespaces"]
+          verbs: ["get", "list", "watch", "delete"]
+          resourceNames: ["{{ .Release.Namespace }}", "open-cluster-management", "open-cluster-management-agent", "open-cluster-management-agent-addon"]
+        - apiGroups: [""]
+          resources: ["pods", "serviceaccounts"]
+          verbs: ["get", "list", "watch"]
+        - apiGroups: ["apps"]
+          resources: ["deployments"]
+          verbs: ["get", "list", "watch"]
+        - apiGroups: ["rbac.authorization.k8s.io"]
+          resources: ["clusterrolebindings", "clusterroles"]
+          verbs: ["get", "list", "watch"]
+        - apiGroups: ["operator.open-cluster-management.io"]
+          resources: ["klusterlets"]
+          verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+        - apiGroups: ["work.open-cluster-management.io"]
+          resources: ["appliedmanifestworks"]
+          verbs: ["get", "list", "watch", "create", "update", "patch", "delete", "deletecollection"]
+        - apiGroups: ["cluster.open-cluster-management.io"]
+          resources: ["clusterclaims"]
+          verbs: ["get", "list", "watch"]
+        - apiGroups: ["apiextensions.k8s.io"]
+          resources: ["customresourcedefinitions"]
+          verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+      - kind: ClusterRoleBinding
+        apiVersion: rbac.authorization.k8s.io/v1
+        metadata:
+          name: {{ include "chart.fullname" . }}-agent-rolebinding
+        roleRef:
+          apiGroup: rbac.authorization.k8s.io
+          kind: ClusterRole
+          name: {{ include "chart.fullname" . }}-agent-role
+        subjects:
+          - kind: ServiceAccount
+            name: {{ include "chart.fullname" . }}-agent
+            namespace: {{ .Release.Namespace }}
+      - kind: Role
+        apiVersion: rbac.authorization.k8s.io/v1
+        metadata:
+          name: {{ include "chart.fullname" . }}-leader-election-role
+          namespace: {{ .Release.Namespace }}
+          labels:
+          {{- include "chart.labels" . | nindent 12 }}
+        rules:
+        - apiGroups: [""]
+          resources: [configmaps]
+          verbs: [get, list, watch, create, update, patch, delete]
+        - apiGroups: [coordination.k8s.io]
+          resources: [leases]
+          verbs: [get, list, watch, create, update, patch, delete]
+        - apiGroups: [""]
+          resources: [events]
+          verbs: [create, patch]
+      - kind: RoleBinding
+        apiVersion: rbac.authorization.k8s.io/v1
+        metadata:
+          name: {{ include "chart.fullname" . }}-leader-election-rolebinding
+          namespace: {{ .Release.Namespace }}
+          labels:
+          {{- include "chart.labels" . | nindent 12 }}
+        roleRef:
+          apiGroup: rbac.authorization.k8s.io
+          kind: Role
+          name: {{ include "chart.fullname" . }}-leader-election-role
+        subjects:
+        - kind: ServiceAccount
+          name: {{ include "chart.fullname" . }}-agent
+          namespace: {{ .Release.Namespace }}
+  registration:
+    - type: KubeClient
+      kubeClient:
+        hubPermissions:
+          - type: CurrentCluster
+            currentCluster:
+              clusterRoleName: {{ include "chart.fullname" . }}-manager-role
+{{- end }}

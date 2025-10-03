@@ -5,9 +5,9 @@ COLOR_CYAN="\033[0;36m"
 COLOR_RESET="\033[0m"
 
 export CGO_ENABLED=0
-FLAGS="--use-webhook=true --webhook-port=9443 --webhook-cert-dir=/etc/k8s-webhook-certs"
+FLAGS="--instance-type=agent --spoke-concurrent-reconciles=1"
 RUN_CMD="go run ./cmd/main.go $FLAGS"
-DEBUG_CMD="dlv debug ./cmd/main.go --listen=0.0.0.0:2344 --api-version=2 --output /tmp/__debug_bin --headless -- $FLAGS"
+DEBUG_CMD="dlv debug ./cmd/main.go --listen=0.0.0.0:2345 --api-version=2 --output /tmp/__debug_bin --headless -- $FLAGS"
 
 echo -e "${COLOR_CYAN}
    ____              ____
@@ -24,8 +24,8 @@ This is how you can work with it:
 
 If you wish to run the fleetconfig controller manager in debug mode with delve, run:
   \`${COLOR_CYAN}${DEBUG_CMD}${COLOR_RESET}\`
-  Wait until the \`${COLOR_CYAN}API server listening at: [::]:2344${COLOR_RESET}\` message appears
-  Start the \"Debug (localhost:2344)\" configuration in VSCode to connect your debugger session.
+  Wait until the \`${COLOR_CYAN}API server listening at: [::]:2345${COLOR_RESET}\` message appears
+  Start the \"Debug (localhost:2345)\" configuration in VSCode to connect your debugger session.
   ${COLOR_CYAN}Note:${COLOR_RESET} fleetconfig controller manager won't start until you connect with the debugger.
   ${COLOR_CYAN}Note:${COLOR_RESET} fleetconfig controller manager will be stopped once you detach your debugger session.
 

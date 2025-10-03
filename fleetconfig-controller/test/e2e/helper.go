@@ -35,7 +35,7 @@ import (
 
 const (
 	fcNamespace                = "fleetconfig-system"
-	spokeSecretName            = "test-fleetconfig-kubeconfig"
+	spokeSecretName            = "test-spoke-kubeconfig"
 	klusterletAnnotationPrefix = "agent.open-cluster-management.io"
 	kubeconfigSecretKey        = "value"
 	hubAsSpokeName             = v1alpha1.ManagedClusterTypeHubAsSpoke
@@ -53,6 +53,8 @@ var (
 	v1beta1hubNN        = ktypes.NamespacedName{Name: "hub", Namespace: fcNamespace}
 	v1beta1spokeNN      = ktypes.NamespacedName{Name: "spoke", Namespace: fcNamespace}
 	v1beta1hubAsSpokeNN = ktypes.NamespacedName{Name: "hub-as-spoke", Namespace: fcNamespace}
+
+	v1beta1fccAddOnAgentNN = ktypes.NamespacedName{Name: "fleetconfig-controller-manager", Namespace: fcNamespace}
 
 	// global test variables
 	klusterletNN = ktypes.NamespacedName{Name: "klusterlet"}
@@ -480,11 +482,14 @@ func ensureHubAndSpokesProvisioned(tc *E2EContext, hub *v1beta1.Hub, spokes []*v
 		"HubInitialized":   metav1.ConditionTrue,
 		"CleanupFailed":    metav1.ConditionFalse,
 		"AddonsConfigured": metav1.ConditionTrue,
+		"HubUpgradeFailed": metav1.ConditionFalse,
 	}
 	spokeExpectedConditions := map[string]metav1.ConditionStatus{
 		"SpokeJoined":      metav1.ConditionTrue,
 		"CleanupFailed":    metav1.ConditionFalse,
 		"AddonsConfigured": metav1.ConditionTrue,
+		"PivotComplete":    metav1.ConditionTrue,
+		"KlusterletSynced": metav1.ConditionTrue,
 	}
 	for k, v := range extraExpectedConditions {
 		hubExpectedConditions[k] = v

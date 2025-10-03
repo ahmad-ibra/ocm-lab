@@ -2,8 +2,10 @@ package v1beta1
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/url"
+	"os"
 	"os/exec"
 	"slices"
 	"strings"
@@ -11,11 +13,13 @@ import (
 
 	"github.com/pkg/errors"
 	corev1 "k8s.io/api/core/v1"
+	rbacv1 "k8s.io/api/rbac/v1"
 	kerrs "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/wait"
 
 	"k8s.io/apimachinery/pkg/types"
+	addonv1alpha1 "open-cluster-management.io/api/addon/v1alpha1"
 	addonapi "open-cluster-management.io/api/client/addon/clientset/versioned"
 	workapi "open-cluster-management.io/api/client/work/clientset/versioned"
 	workv1 "open-cluster-management.io/api/work/v1"
@@ -23,31 +27,10 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	"github.com/open-cluster-management-io/lab/fleetconfig-controller/api/v1beta1"
+	arg_utils "github.com/open-cluster-management-io/lab/fleetconfig-controller/internal/args"
 	exec_utils "github.com/open-cluster-management-io/lab/fleetconfig-controller/internal/exec"
 	"github.com/open-cluster-management-io/lab/fleetconfig-controller/internal/file"
 )
-
-const (
-	// commands
-	addon   = "addon"
-	create  = "create"
-	enable  = "enable"
-	disable = "disable"
-
-	install   = "install"
-	uninstall = "uninstall"
-	hubAddon  = "hub-addon"
-
-	addonArgoCD = "argocd"
-	addonGPF    = "governance-policy-framework"
-
-	managedClusterAddOn = "ManagedClusterAddOn"
-)
-
-var supportedHubAddons = []string{
-	addonArgoCD,
-	addonGPF,
-}
 
 // getManagedClusterAddOns returns the list of ManagedClusterAddOns currently installed on a spoke cluster
 func getManagedClusterAddOns(ctx context.Context, addonC *addonapi.Clientset, spokeName string) ([]string, error) {
@@ -75,7 +58,7 @@ func getHubAddOns(ctx context.Context, addonC *addonapi.Clientset) ([]string, er
 
 	var hubAddons []string
 	for _, addon := range allClusterManagementAddOns.Items {
-		if slices.Contains(supportedHubAddons, addon.Name) && addon.Labels[v1beta1.LabelAddOnManagedBy] == "" {
+		if slices.Contains(v1beta1.SupportedHubAddons, addon.Name) && addon.Labels[v1beta1.LabelAddOnManagedBy] == "" {
 			hubAddons = append(hubAddons, addon.Name)
 		}
 	}
@@ -206,7 +189,7 @@ func handleAddonCreate(ctx context.Context, kClient client.Client, hub *v1beta1.
 			args = append(args, fmt.Sprintf("--cluster-role-bind=%s", a.ClusterRoleBinding))
 		}
 
-		logger.V(7).Info("running", "command", clusteradm, "args", args)
+		logger.V(7).Info("running", "command", clusteradm, "args", arg_utils.SanitizeArgs(args))
 		cmd := exec.Command(clusteradm, args...)
 		stdout, stderr, err := exec_utils.CmdWithLogs(ctx, cmd, "waiting for 'clusteradm addon create' to complete...")
 		if err != nil {
@@ -346,7 +329,7 @@ func handleSpokeAddons(ctx context.Context, addonC *addonapi.Clientset, spoke *v
 	}
 
 	// Enable new addons and updated addons
-	newEnabledAddons, err := handleAddonEnable(ctx, spoke, addonsToEnable)
+	newEnabledAddons, err := handleAddonEnable(ctx, spoke, addonsToEnable, addonC)
 	// even if an error is returned, any addon which was successfully enabled is tracked, so append before returning
 	enabledAddons = append(enabledAddons, newEnabledAddons...)
 	if err != nil {
@@ -362,7 +345,7 @@ func handleSpokeAddons(ctx context.Context, addonC *addonapi.Clientset, spoke *v
 	return enabledAddons, nil
 }
 
-func handleAddonEnable(ctx context.Context, spoke *v1beta1.Spoke, addons []v1beta1.AddOn) ([]string, error) {
+func handleAddonEnable(ctx context.Context, spoke *v1beta1.Spoke, addons []v1beta1.AddOn, addonC *addonapi.Clientset) ([]string, error) {
 	if len(addons) == 0 {
 		return nil, nil
 	}
@@ -396,7 +379,7 @@ func handleAddonEnable(ctx context.Context, spoke *v1beta1.Spoke, addons []v1bet
 		}
 
 		args = append(baseArgs, args...)
-		logger.V(7).Info("running", "command", clusteradm, "args", args)
+		logger.V(7).Info("running", "command", clusteradm, "args", arg_utils.SanitizeArgs(args))
 		cmd := exec.Command(clusteradm, args...)
 		stdout, stderr, err := exec_utils.CmdWithLogs(ctx, cmd, "waiting for 'clusteradm addon enable' to complete...")
 		if err != nil {
@@ -404,6 +387,15 @@ func handleAddonEnable(ctx context.Context, spoke *v1beta1.Spoke, addons []v1bet
 			enableErrs = append(enableErrs, fmt.Errorf("failed to enable addon: %v, output: %s", err, string(out)))
 			continue
 		}
+		// TODO - do this natively with clusteradm once https://github.com/open-cluster-management-io/clusteradm/issues/501 is resolved.
+		if a.ConfigName == v1beta1.FCCAddOnName {
+			err = patchFCCMca(ctx, spoke.Name, addonC)
+			if err != nil {
+				enableErrs = append(enableErrs, err)
+				continue
+			}
+		}
+
 		enabledAddons = append(enabledAddons, a.ConfigName)
 		logger.V(1).Info("enabled addon", "managedcluster", spoke.Name, "addon", a.ConfigName, "output", string(stdout))
 	}
@@ -412,6 +404,48 @@ func handleAddonEnable(ctx context.Context, spoke *v1beta1.Spoke, addons []v1bet
 		return enabledAddons, fmt.Errorf("one or more addons were not enabled: %v", enableErrs)
 	}
 	return enabledAddons, nil
+}
+
+func patchFCCMca(ctx context.Context, spokeName string, addonC *addonapi.Clientset) error {
+	mca, err := addonC.AddonV1alpha1().ManagedClusterAddOns(spokeName).Get(ctx, v1beta1.FCCAddOnName, metav1.GetOptions{})
+	if err != nil {
+		return fmt.Errorf("failed to configure %s: %v", v1beta1.FCCAddOnName, err)
+	}
+	desired := addonv1alpha1.AddOnConfig{
+		ConfigGroupResource: addonv1alpha1.ConfigGroupResource{
+			Group:    addonv1alpha1.GroupName,
+			Resource: AddOnDeploymentConfigResource,
+		},
+		ConfigReferent: addonv1alpha1.ConfigReferent{
+			Name:      v1beta1.FCCAddOnName,
+			Namespace: spokeName,
+		},
+	}
+	if slices.ContainsFunc(mca.Spec.Configs, func(c addonv1alpha1.AddOnConfig) bool {
+		return c.Group == desired.Group &&
+			c.Resource == desired.Resource &&
+			c.Name == desired.Name &&
+			c.Namespace == desired.Namespace
+	}) {
+		return nil
+	}
+	mca.Spec.Configs = append(mca.Spec.Configs, desired)
+	patchBytes, err := json.Marshal(map[string]any{
+		"spec": map[string]any{"configs": mca.Spec.Configs},
+	})
+	if err != nil {
+		return fmt.Errorf("failed to marshal patch for %s: %v", v1beta1.FCCAddOnName, err)
+	}
+	if _, err = addonC.AddonV1alpha1().ManagedClusterAddOns(spokeName).Patch(
+		ctx,
+		v1beta1.FCCAddOnName,
+		types.MergePatchType,
+		patchBytes,
+		metav1.PatchOptions{},
+	); err != nil {
+		return fmt.Errorf("failed to patch %s: %v", v1beta1.FCCAddOnName, err)
+	}
+	return nil
 }
 
 func handleAddonDisable(ctx context.Context, spoke *v1beta1.Spoke, enabledAddons []string) error {
@@ -429,7 +463,7 @@ func handleAddonDisable(ctx context.Context, spoke *v1beta1.Spoke, enabledAddons
 		fmt.Sprintf("--clusters=%s", spoke.Name),
 	}, spoke.BaseArgs()...)
 
-	logger.V(7).Info("running", "command", clusteradm, "args", args)
+	logger.V(7).Info("running", "command", clusteradm, "args", arg_utils.SanitizeArgs(args))
 	cmd := exec.Command(clusteradm, args...)
 	stdout, stderr, err := exec_utils.CmdWithLogs(ctx, cmd, "waiting for 'clusteradm addon disable' to complete...")
 	if err != nil {
@@ -464,7 +498,10 @@ func handleHubAddons(ctx context.Context, addonC *addonapi.Clientset, hub *v1bet
 	logger.V(0).Info("handleHubAddons", "fleetconfig", hub.Name)
 
 	desiredAddOns := hub.Spec.HubAddOns
-	bundleVersion := hub.Spec.ClusterManager.Source.BundleVersion
+	bundleVersion := v1beta1.BundleVersionLatest
+	if hub.Spec.ClusterManager != nil {
+		bundleVersion = hub.Spec.ClusterManager.Source.BundleVersion
+	}
 
 	hubAddons, err := getHubAddOns(ctx, addonC)
 	if err != nil {
@@ -557,7 +594,7 @@ func handleHubAddonUninstall(ctx context.Context, addons []v1beta1.InstalledHubA
 			args = append(args, fmt.Sprintf("--namespace=%s", addon.Namespace))
 		}
 
-		logger.V(7).Info("running", "command", clusteradm, "args", args)
+		logger.V(7).Info("running", "command", clusteradm, "args", arg_utils.SanitizeArgs(args))
 		cmd := exec.Command(clusteradm, args...)
 		stdout, stderr, err := exec_utils.CmdWithLogs(ctx, cmd, "waiting for 'clusteradm uninstall hub-addon' to complete...")
 		if err != nil {
@@ -607,6 +644,7 @@ func handleHubAddonInstall(ctx context.Context, addonC *addonapi.Clientset, addo
 			args = append(args, fmt.Sprintf("--namespace=%s", addon.InstallNamespace))
 		}
 
+		logger.V(7).Info("running", "command", clusteradm, "args", arg_utils.SanitizeArgs(args))
 		cmd := exec.Command(clusteradm, args...)
 		stdout, stderr, err := exec_utils.CmdWithLogs(ctx, cmd, "waiting for 'clusteradm install hub-addon' to complete...")
 		if err != nil {
@@ -617,7 +655,7 @@ func handleHubAddonInstall(ctx context.Context, addonC *addonapi.Clientset, addo
 		}
 		// the argocd pull integration addon logs the entire helm template output including CRDs to stdout.
 		// to prevent flooding the logs, overwrite it.
-		if addon.Name == addonArgoCD {
+		if addon.Name == v1beta1.AddonArgoCD {
 			stdout = []byte("ArgoCD hub addon successfully installed")
 		}
 		logger.V(1).Info("installed hubAddon", "name", addon.Name, "output", string(stdout))
@@ -642,7 +680,7 @@ func isAddonInstalled(ctx context.Context, addonC *addonapi.Clientset, addonName
 
 // waitForAddonManifestWorksCleanup polls for addon-related manifestWorks to be removed
 // after addon disable operation to avoid race conditions during spoke unjoin
-func waitForAddonManifestWorksCleanup(ctx context.Context, workC *workapi.Clientset, spokeName string, timeout time.Duration) error {
+func waitForAddonManifestWorksCleanup(ctx context.Context, workC *workapi.Clientset, spokeName string, timeout time.Duration, shouldCleanAll bool) error {
 	logger := log.FromContext(ctx)
 	logger.V(1).Info("waiting for addon manifestWorks cleanup", "spokeName", spokeName, "timeout", timeout)
 
@@ -654,9 +692,24 @@ func waitForAddonManifestWorksCleanup(ctx context.Context, workC *workapi.Client
 			return false, nil
 		}
 
-		// Success condition: no manifestWorks remaining
-		if len(manifestWorks.Items) == 0 {
-			logger.V(1).Info("addon manifestWorks cleanup completed", "spokeName", spokeName, "remainingManifestWorks", len(manifestWorks.Items))
+		// for hub-as-spoke, or if the pivot failed, all addons must be removed.
+		// otherwise, fleetconfig-controller-agent must not be removed.
+		var expectedWorks = 0
+		if !shouldCleanAll {
+			expectedWorks = 1
+		}
+
+		if len(manifestWorks.Items) == expectedWorks {
+			if shouldCleanAll {
+				logger.V(1).Info("addon manifestWorks cleanup completed", "spokeName", spokeName, "remainingManifestWorks", len(manifestWorks.Items))
+				return true, nil
+			}
+			mw := manifestWorks.Items[0]
+			val, ok := mw.Labels[addonv1alpha1.AddonLabelKey]
+			if !ok || val != v1beta1.FCCAddOnName {
+				return false, fmt.Errorf("unexpected remaining ManifestWork: expected %s, got label=%q (ok=%t)", v1beta1.FCCAddOnName, val, ok)
+			}
+			logger.V(1).Info("addon manifestWorks cleanup completed", "spokeName", spokeName, "remainingManifestWork", mw.Name)
 			return true, nil
 		}
 
@@ -684,4 +737,83 @@ func allOwnersAddOns(mws []workv1.ManifestWork) bool {
 		}
 	}
 	return true
+}
+
+// bindAddonAgent creates the necessary bindings for fcc agent to access hub resources
+func (r *SpokeReconciler) bindAddonAgent(ctx context.Context, spoke *v1beta1.Spoke) error {
+	roleName := os.Getenv(v1beta1.ClusterRoleNameEnvVar)
+	if roleName == "" {
+		roleName = v1beta1.DefaultFCCManagerRole
+	}
+
+	roleRef := rbacv1.RoleRef{
+		Kind:     "ClusterRole",
+		APIGroup: rbacv1.GroupName,
+		Name:     roleName,
+	}
+
+	err := r.createBinding(ctx, roleRef, spoke.Namespace, spoke.Name)
+	if err != nil {
+		return err
+	}
+	if spoke.Spec.HubRef.Namespace != spoke.Namespace {
+		err = r.createBinding(ctx, roleRef, spoke.Spec.HubRef.Namespace, spoke.Name)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// createBinding creates a role binding for a given role.
+// The role binding follows a different naming format than OCM uses for addon agents.
+// We need to append the spoke name to avoid possible conflicts in cases where multiple spokes exist in 1 namespace
+func (r *SpokeReconciler) createBinding(ctx context.Context, roleRef rbacv1.RoleRef, namespace, spokeName string) error {
+	logger := log.FromContext(ctx)
+
+	binding := &rbacv1.RoleBinding{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: fmt.Sprintf("open-cluster-management:%s:%s:agent-%s",
+				v1beta1.FCCAddOnName, strings.ToLower(roleRef.Kind), spokeName),
+			Namespace: namespace,
+			Labels: map[string]string{
+				addonv1alpha1.AddonLabelKey: v1beta1.FCCAddOnName,
+			},
+		},
+		RoleRef: roleRef,
+		Subjects: []rbacv1.Subject{
+			{
+				Kind:     rbacv1.GroupKind,
+				APIGroup: rbacv1.GroupName,
+				Name:     clusterAddonGroup(spokeName, v1beta1.FCCAddOnName),
+			},
+		},
+	}
+
+	err := r.Create(ctx, binding, &client.CreateOptions{})
+	if err != nil {
+		if !kerrs.IsAlreadyExists(err) {
+			logger.Error(err, "failed to create role binding for addon")
+			return err
+		}
+		curr := &rbacv1.RoleBinding{}
+		err = r.Get(ctx, types.NamespacedName{Namespace: binding.Namespace, Name: binding.Name}, curr)
+		if err != nil {
+			logger.Error(err, "failed to get role binding for addon")
+			return err
+		}
+		binding.SetResourceVersion(curr.ResourceVersion)
+		err = r.Update(ctx, binding)
+		if err != nil {
+			logger.Error(err, "failed to update role binding for addon")
+			return err
+		}
+	}
+	return nil
+}
+
+// clusterAddonGroup returns the group that represents the addon for the cluster
+// ref: https://github.com/open-cluster-management-io/ocm/blob/main/pkg/addon/templateagent/registration.go#L484
+func clusterAddonGroup(clusterName, addonName string) string {
+	return fmt.Sprintf("system:open-cluster-management:cluster:%s:addon:%s", clusterName, addonName)
 }

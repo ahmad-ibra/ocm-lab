@@ -43,7 +43,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	"github.com/open-cluster-management-io/lab/fleetconfig-controller/api/v1beta1"
-	"github.com/open-cluster-management-io/lab/fleetconfig-controller/internal/args"
+	arg_utils "github.com/open-cluster-management-io/lab/fleetconfig-controller/internal/args"
 	exec_utils "github.com/open-cluster-management-io/lab/fleetconfig-controller/internal/exec"
 	"github.com/open-cluster-management-io/lab/fleetconfig-controller/internal/file"
 	"github.com/open-cluster-management-io/lab/fleetconfig-controller/internal/kube"
@@ -136,6 +136,9 @@ func (r *HubReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.R
 		),
 		v1beta1.NewCondition(
 			v1beta1.AddonsConfigured, v1beta1.AddonsConfigured, metav1.ConditionFalse, metav1.ConditionFalse,
+		),
+		v1beta1.NewCondition(
+			v1beta1.HubUpgradeFailed, v1beta1.HubUpgradeFailed, metav1.ConditionFalse, metav1.ConditionFalse,
 		),
 	}
 	hub.SetConditions(false, initConditions...)
@@ -245,6 +248,7 @@ func (r *HubReconciler) cleanHub(ctx context.Context, hub *v1beta1.Hub, hubKubec
 	}
 	cleanArgs = append(cleanArgs, hub.BaseArgs()...)
 
+	logger.V(7).Info("running", "command", clusteradm, "args", arg_utils.SanitizeArgs(cleanArgs))
 	cmd := exec.Command(clusteradm, cleanArgs...)
 	stdout, stderr, err := exec_utils.CmdWithLogs(ctx, cmd, "waiting for 'clusteradm clean' to complete...")
 	if err != nil {
@@ -336,11 +340,23 @@ func (r *HubReconciler) handleHub(ctx context.Context, hub *v1beta1.Hub, hubKube
 	if hub.Spec.ClusterManager != nil {
 		upgrade, err := r.hubNeedsUpgrade(ctx, hub, operatorC)
 		if err != nil {
+			hub.SetConditions(true, v1beta1.NewCondition(
+				err.Error(), v1beta1.HubUpgradeFailed, metav1.ConditionTrue, metav1.ConditionFalse,
+			))
 			return fmt.Errorf("failed to check if hub needs upgrade: %w", err)
 		}
 		if upgrade {
-			return r.upgradeHub(ctx, hub)
+			err = r.upgradeHub(ctx, hub)
+			if err != nil {
+				hub.SetConditions(true, v1beta1.NewCondition(
+					err.Error(), v1beta1.HubUpgradeFailed, metav1.ConditionTrue, metav1.ConditionFalse,
+				))
+				return fmt.Errorf("failed to upgrade hub: %w", err)
+			}
 		}
+		hub.SetConditions(true, v1beta1.NewCondition(
+			v1beta1.HubUpgradeFailed, v1beta1.HubUpgradeFailed, metav1.ConditionFalse, metav1.ConditionFalse,
+		))
 	}
 
 	return nil
@@ -406,13 +422,13 @@ func (r *HubReconciler) initializeHub(ctx context.Context, hub *v1beta1.Hub, hub
 		initArgs = append(initArgs, "--bundle-version", hub.Spec.ClusterManager.Source.BundleVersion)
 		initArgs = append(initArgs, "--image-registry", hub.Spec.ClusterManager.Source.Registry)
 		// resources args
-		initArgs = append(initArgs, args.PrepareResources(hub.Spec.ClusterManager.Resources)...)
+		initArgs = append(initArgs, arg_utils.PrepareResources(hub.Spec.ClusterManager.Resources)...)
 	} else {
 		// one of clusterManager or singletonControlPlane must be specified, per validating webhook, but handle the edge case anyway
 		return fmt.Errorf("unknown hub type, must specify either hub.clusterManager or hub.singletonControlPlane")
 	}
 
-	initArgs, cleanupKcfg, err := args.PrepareKubeconfig(ctx, hubKubeconfig, hub.Spec.Kubeconfig.Context, initArgs)
+	initArgs, cleanupKcfg, err := arg_utils.PrepareKubeconfig(ctx, hubKubeconfig, hub.Spec.Kubeconfig.Context, initArgs)
 	if cleanupKcfg != nil {
 		defer cleanupKcfg()
 	}
@@ -420,7 +436,7 @@ func (r *HubReconciler) initializeHub(ctx context.Context, hub *v1beta1.Hub, hub
 		return err
 	}
 
-	logger.V(1).Info("clusteradm init", "args", initArgs)
+	logger.V(1).Info("clusteradm init", "args", arg_utils.SanitizeArgs(initArgs))
 
 	cmd := exec.Command(clusteradm, initArgs...)
 	stdout, stderr, err := exec_utils.CmdWithLogs(ctx, cmd, "waiting for 'clusteradm init' to complete...")
@@ -428,7 +444,7 @@ func (r *HubReconciler) initializeHub(ctx context.Context, hub *v1beta1.Hub, hub
 		out := append(stdout, stderr...)
 		return fmt.Errorf("failed to init hub: %v, output: %s", err, string(out))
 	}
-	logger.V(1).Info("hub initialized", "output", string(stdout))
+	logger.V(1).Info("hub initialized", "output", string(arg_utils.SanitizeOutput(stdout)))
 
 	return nil
 }
@@ -438,11 +454,11 @@ func (r *HubReconciler) hubNeedsUpgrade(ctx context.Context, hub *v1beta1.Hub, o
 	logger := log.FromContext(ctx)
 	logger.V(0).Info("hubNeedsUpgrade", "hub", hub.Name)
 
-	if hub.Spec.ClusterManager.Source.BundleVersion == "default" {
+	if hub.Spec.ClusterManager.Source.BundleVersion == v1beta1.BundleVersionDefault {
 		logger.V(0).Info("clustermanager bundleVersion is default, skipping upgrade")
 		return false, nil
 	}
-	if hub.Spec.ClusterManager.Source.BundleVersion == "latest" {
+	if hub.Spec.ClusterManager.Source.BundleVersion == v1beta1.BundleVersionLatest {
 		logger.V(0).Info("clustermanager bundleVersion is latest, attempting upgrade")
 		return true, nil
 	}
@@ -494,7 +510,7 @@ func (r *HubReconciler) upgradeHub(ctx context.Context, hub *v1beta1.Hub) error 
 		"--wait=true",
 	}, hub.BaseArgs()...)
 
-	logger.V(1).Info("clusteradm upgrade clustermanager", "args", upgradeArgs)
+	logger.V(1).Info("clusteradm upgrade clustermanager", "args", arg_utils.SanitizeArgs(upgradeArgs))
 
 	cmd := exec.Command(clusteradm, upgradeArgs...)
 	stdout, stderr, err := exec_utils.CmdWithLogs(ctx, cmd, "waiting for 'clusteradm upgrade clustermanager' to complete...")

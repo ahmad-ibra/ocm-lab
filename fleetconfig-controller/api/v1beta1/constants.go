@@ -3,10 +3,13 @@ package v1beta1
 import "k8s.io/apimachinery/pkg/labels"
 
 const (
-	// HubCleanupFinalizer is the finalizer for Hub cleanup.
+	// HubCleanupPreflightFinalizer is the finalizer for cleanup preflight checks hub cluster's controller instance. Used to signal to the spoke's controller that unjoin can proceed.
+	HubCleanupPreflightFinalizer = "fleetconfig.open-cluster-management.io/hub-cleanup-preflight"
+
+	// HubCleanupFinalizer is the finalizer for cleanup by the hub cluster's controller instance.
 	HubCleanupFinalizer = "fleetconfig.open-cluster-management.io/hub-cleanup"
 
-	// SpokeCleanupFinalizer is the finalizer for Spoke cleanup.
+	// SpokeCleanupFinalizer is the finalizer for cleanup by the spoke cluster's controller instance.
 	SpokeCleanupFinalizer = "fleetconfig.open-cluster-management.io/spoke-cleanup"
 )
 
@@ -21,8 +24,17 @@ const (
 	// CleanupFailed means that a failure occurred during cleanup.
 	CleanupFailed = "CleanupFailed"
 
-	// SpokeJoined means that the spoke has successfully joined the Hub.
+	// SpokeJoined means that the Spoke has successfully joined the Hub.
 	SpokeJoined = "SpokeJoined"
+
+	// PivotComplete means that the spoke cluster has successfully started managing itself.
+	PivotComplete = "PivotComplete"
+
+	// KlusterletSynced means that Klusterlet's OCM bundle version and values are up to date.
+	KlusterletSynced = "KlusterletSynced"
+
+	// HubUpgradeFailed means that the ClusterManager version upgrade failed.
+	HubUpgradeFailed = "HubUpgradeFailed"
 )
 
 // Hub and Spoke condition reasons
@@ -64,6 +76,74 @@ const (
 	// ManagedClusterTypeHubAsSpoke is the type of managed cluster that is both a hub and a spoke.
 	ManagedClusterTypeHubAsSpoke = "hub-as-spoke"
 )
+
+// Addon mode
+const (
+	// InstanceTypeManager indicates that the controller is running in a Hub cluster and only handles day 1 Spoke operations.
+	InstanceTypeManager = "manager"
+
+	// InstanceTypeAgent indicates that the controller is running in a Spoke cluster and only handles day 2 Spoke operations.
+	InstanceTypeAgent = "agent"
+
+	// InstanceTypeUnified indicates that the controller is running in a Hub cluster and handles the entire lifecycle of Spoke resources.
+	InstanceTypeUnified = "unified"
+
+	// HubKubeconfigEnvVar is the environment variable containing the path to the mounted Hub kubeconfig.
+	HubKubeconfigEnvVar = "HUB_KUBECONFIG"
+
+	// DefaultHubKubeconfigPath is the path of the mounted kubeconfig when the controller is running in a Spoke cluster. Used if the environment variable is not set.
+	DefaultHubKubeconfigPath = "/managed/hub-kubeconfig/kubeconfig"
+
+	// SpokeNameEnvVar is the environment variable containing the name of the Spoke resource.
+	SpokeNameEnvVar = "CLUSTER_NAME"
+
+	// SpokeNamespaceEnvVar is the environment variable containing the namespace of the Spoke resource.
+	SpokeNamespaceEnvVar = "CLUSTER_NAMESPACE"
+
+	// HubNamespaceEnvVar is the environment variable containing the namespace of the Hub resource.
+	HubNamespaceEnvVar = "HUB_NAMESPACE"
+
+	// ControllerNamespaceEnvVar is the environment variable containing the namespace that the controller is deployed to.
+	ControllerNamespaceEnvVar = "CONTROLLER_NAMESPACE"
+
+	// ClusterRoleNameEnvVar is the environment variable containing the name of the ClusterRole for fleetconfig-controller-manager.
+	ClusterRoleNameEnvVar = "CLUSTER_ROLE_NAME"
+
+	// PurgeAgentNamespaceEnvVar is the environment variable used to signal to the agent whether or not it should garbage collect it install namespace.
+	PurgeAgentNamespaceEnvVar = "PURGE_AGENT_NAMESPACE"
+
+	// FCCAddOnName is the name of the fleetconfig-controller addon.
+	FCCAddOnName = "fleetconfig-controller-agent"
+
+	// DefaultFCCManagerRole is the default name of the fleetconfig-controller-manager ClusterRole.
+	DefaultFCCManagerRole = "fleetconfig-controller-manager-role"
+
+	// NamespaceOCM is the open-cluster-management namespace.
+	NamespaceOCM = "open-cluster-management"
+
+	// NamespaceOCMAgent is the namespace for the open-cluster-management agent.
+	NamespaceOCMAgent = "open-cluster-management-agent"
+
+	// NamespaceOCMAgentAddOn is the namespace for open-cluster-management agent addons.
+	NamespaceOCMAgentAddOn = "open-cluster-management-agent-addon"
+
+	// AgentCleanupWatcherName is the name of the watcher for cleaning up the spoke agent.
+	AgentCleanupWatcherName = "agent-cleanup-watcher"
+)
+
+// SupportedInstanceTypes are the valid cluster types that the controller can be installed in.
+var SupportedInstanceTypes = []string{
+	InstanceTypeManager,
+	InstanceTypeAgent,
+	InstanceTypeUnified,
+}
+
+// OCMSpokeNamespaces are the namespaces created on an OCM managed cluster.
+var OCMSpokeNamespaces = []string{
+	NamespaceOCM,
+	NamespaceOCMAgent,
+	NamespaceOCMAgentAddOn,
+}
 
 // FleetConfig labels
 const (
@@ -111,4 +191,26 @@ var (
 	}
 	// ManagedBySelector is a label selector for filtering add-on resources managed fleetconfig-controller.
 	ManagedBySelector = labels.SelectorFromSet(labels.Set(ManagedByLabels))
+)
+
+const (
+	// AddonArgoCD is the name of the built-in ArgoCD hub addon.
+	AddonArgoCD = "argocd"
+
+	// AddonGPF is the name of the built-in Governance Policy Framework hub addon.
+	AddonGPF = "governance-policy-framework"
+)
+
+// SupportedHubAddons are the built-in hub addons which clusteradm and fleetconfig-controller support.
+var SupportedHubAddons = []string{
+	AddonArgoCD,
+	AddonGPF,
+}
+
+const (
+	// BundleVersionLatest is the latest OCM source version
+	BundleVersionLatest = "latest"
+
+	// BundleVersionDefault is the default OCM source version
+	BundleVersionDefault = "default"
 )

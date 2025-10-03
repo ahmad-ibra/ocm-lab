@@ -80,6 +80,30 @@ type SpokeSpec struct {
 	// +kubebuilder:default:=0
 	// +optional
 	LogVerbosity int `json:"logVerbosity,omitempty"`
+
+	// CleanupConfig is used to configure which resources should be automatically garbage collected during cleanup.
+	// +kubebuilder:default:={}
+	// +required
+	CleanupConfig CleanupConfig `json:"cleanupConfig"`
+}
+
+// CleanupConfig is the configuration for cleaning up resources during Spoke cleanup.
+type CleanupConfig struct {
+	// If true, the agent will attempt to garbage collect its own namespace after the spoke cluster is unjoined.
+	// +kubebuilder:default:=false
+	// +optional
+	PurgeAgentNamespace bool `json:"purgeAgentNamespace,omitempty"`
+
+	// If set, the klusterlet operator will be purged and all open-cluster-management namespaces deleted
+	// when the klusterlet is unjoined from its Hub cluster.
+	// +kubebuilder:default:=true
+	// +optional
+	PurgeKlusterletOperator bool `json:"purgeKlusterletOperator,omitempty"`
+
+	// If set, the kubeconfig secret will be automatically deleted after the agent has taken over managing the Spoke.
+	// +kubebuilder:default:=false
+	// +optional
+	PurgeKubeconfigSecret bool `json:"purgeKubeconfigSecret,omitempty"`
 }
 
 // HubRef is the information required to get a Hub resource.
@@ -96,6 +120,21 @@ type HubRef struct {
 // IsManagedBy checks whether or not the Spoke is managed by a particular Hub.
 func (s *Spoke) IsManagedBy(om metav1.ObjectMeta) bool {
 	return s.Spec.HubRef.Name == om.Name && s.Spec.HubRef.Namespace == om.Namespace
+}
+
+// IsHubAsSpoke returns true if the cluster is a hub-as-spoke. Determined either by name `hub-as-spoke` or an InCluster kubeconfig
+func (s *Spoke) IsHubAsSpoke() bool {
+	return s.Name == ManagedClusterTypeHubAsSpoke || s.Spec.Kubeconfig.InCluster
+}
+
+// PivotComplete return true if the spoke's agent has successfully started managing day 2 operations.
+func (s *Spoke) PivotComplete() bool {
+	jc := s.GetCondition(SpokeJoined)
+	if jc == nil || jc.Status != metav1.ConditionTrue {
+		return false
+	}
+	pc := s.GetCondition(PivotComplete)
+	return pc != nil && pc.Status == metav1.ConditionTrue
 }
 
 // Klusterlet is the configuration for a klusterlet.
@@ -123,12 +162,6 @@ type Klusterlet struct {
 	// +kubebuilder:default:="Default"
 	// +optional
 	Mode string `json:"mode,omitempty"`
-
-	// If set, the klusterlet operator will be purged and all open-cluster-management namespaces deleted
-	// when the klusterlet is unjoined from its Hub cluster.
-	// +kubebuilder:default:=true
-	// +optional
-	PurgeOperator bool `json:"purgeOperator,omitempty"`
 
 	// If true, the installed klusterlet agent will start the cluster registration process by looking for the
 	// internal endpoint from the public cluster-info in the Hub cluster instead of using hubApiServer.
