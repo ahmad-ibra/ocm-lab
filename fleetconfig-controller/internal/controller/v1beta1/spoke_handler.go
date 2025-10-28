@@ -21,6 +21,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	addonv1alpha1 "open-cluster-management.io/api/addon/v1alpha1"
 	addonapi "open-cluster-management.io/api/client/addon/clientset/versioned"
+	clusterapi "open-cluster-management.io/api/client/cluster/clientset/versioned"
 	workapi "open-cluster-management.io/api/client/work/clientset/versioned"
 	clusterv1 "open-cluster-management.io/api/cluster/v1"
 	operatorv1 "open-cluster-management.io/api/operator/v1"
@@ -39,26 +40,42 @@ import (
 	"github.com/open-cluster-management-io/lab/fleetconfig-controller/pkg/common"
 )
 
+var (
+	// Taint to drain non-addon workloads (addons can tolerate this)
+	managedClusterWorkloadCleanupTaint = clusterv1.Taint{
+		Key:    v1beta1.ManagedClusterWorkloadCleanupTaint,
+		Effect: clusterv1.TaintEffectNoSelect,
+	}
+
+	// Taint to remove all workloads including addons (nothing tolerates this)
+	managedClusterTerminatingTaint = clusterv1.Taint{
+		Key:    v1beta1.ManagedClusterTerminatingTaint,
+		Effect: clusterv1.TaintEffectNoSelect,
+	}
+)
+
 // cleanup cleans up a Spoke and its associated resources.
-func (r *SpokeReconciler) cleanup(ctx context.Context, spoke *v1beta1.Spoke, hubKubeconfig []byte) error {
+func (r *SpokeReconciler) cleanup(ctx context.Context, spoke *v1beta1.Spoke, hubKubeconfig []byte) (bool, error) {
 	switch r.InstanceType {
 	case v1beta1.InstanceTypeManager:
+		var requeue bool
 		pivotComplete := spoke.PivotComplete()
-		err := r.doHubCleanup(ctx, spoke, hubKubeconfig, pivotComplete)
+
+		requeue, err := r.doHubCleanup(ctx, spoke, hubKubeconfig, pivotComplete)
 		if err != nil {
-			return err
+			return requeue, err
 		}
 		if spoke.IsHubAsSpoke() || !pivotComplete {
-			err = r.doSpokeCleanup(ctx, spoke, false)
+			requeue, err = r.doSpokeCleanup(ctx, spoke, false)
 			if err != nil {
-				return err
+				return requeue, err
 			}
 		}
-		return nil
+		return requeue, nil
 	case v1beta1.InstanceTypeUnified:
-		err := r.doHubCleanup(ctx, spoke, hubKubeconfig, false)
+		requeue, err := r.doHubCleanup(ctx, spoke, hubKubeconfig, false)
 		if err != nil {
-			return err
+			return requeue, err
 		}
 		return r.doSpokeCleanup(ctx, spoke, false)
 	case v1beta1.InstanceTypeAgent:
@@ -456,39 +473,116 @@ func (r *SpokeReconciler) doSpokeWork(ctx context.Context, spoke *v1beta1.Spoke,
 }
 
 // doHubCleanup handles all the required cleanup of a hub cluster when deregistering a Spoke
-func (r *SpokeReconciler) doHubCleanup(ctx context.Context, spoke *v1beta1.Spoke, hubKubeconfig []byte, pivotComplete bool) error {
+func (r *SpokeReconciler) doHubCleanup(ctx context.Context, spoke *v1beta1.Spoke, hubKubeconfig []byte, pivotComplete bool) (bool, error) {
 	logger := log.FromContext(ctx)
 	clusterC, err := common.ClusterClient(hubKubeconfig)
 	if err != nil {
-		return err
+		return true, err
 	}
 	workC, err := common.WorkClient(hubKubeconfig)
 	if err != nil {
-		return err
+		return true, err
 	}
 	addonC, err := common.AddOnClient(hubKubeconfig)
 	if err != nil {
-		return fmt.Errorf("failed to create addon client for cleanup: %w", err)
+		return true, fmt.Errorf("failed to create addon client for cleanup: %w", err)
 	}
 
+	requeue, err := r.hubCleanupPreflight(ctx, spoke, addonC, workC, clusterC, pivotComplete)
+	if err != nil {
+		return requeue, err
+	}
+	if !requeue {
+		return requeue, nil
+	}
+
+	// remove preflight cleanup finalizer - this lets the spoke's controller know to proceed with unjoin.
+	spoke.Finalizers = slices.DeleteFunc(spoke.Finalizers, func(s string) bool {
+		return s == v1beta1.HubCleanupPreflightFinalizer
+	})
+
+	// requeue until unjoin is complete by the spoke's controller
+	if slices.Contains(spoke.Finalizers, v1beta1.SpokeCleanupFinalizer) {
+		logger.V(1).Info("Hub preflight complete, waiting for spoke agent to deregister")
+		return true, nil
+	}
+
+	csrList := &certificatesv1.CertificateSigningRequestList{}
+	if err := r.List(ctx, csrList, client.HasLabels{"open-cluster-management.io/cluster-name"}); err != nil {
+		return true, err
+	}
+	for _, c := range csrList.Items {
+		trimmedName := csrSuffixPattern.ReplaceAllString(c.Name, "")
+		if trimmedName == spoke.Name {
+			if err := r.Delete(ctx, &c); err != nil {
+				return true, err
+			}
+		}
+	}
+
+	err = r.waitForAgentAddonDeleted(ctx, spoke, spoke.DeepCopy(), addonC, workC)
+	if err != nil {
+		return true, err
+	}
+
+	// remove ManagedCluster
+	err = clusterC.ClusterV1().ManagedClusters().Delete(ctx, spoke.Name, metav1.DeleteOptions{})
+	if err != nil && !kerrs.IsNotFound(err) {
+		return true, err
+	}
+	// remove Namespace
+	ns := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: spoke.Name}}
+	err = r.Delete(ctx, ns)
+	if err != nil && !kerrs.IsNotFound(err) {
+		return true, err
+	}
+
+	spoke.Finalizers = slices.DeleteFunc(spoke.Finalizers, func(s string) bool {
+		return s == v1beta1.HubCleanupFinalizer
+	})
+
+	return false, nil
+}
+
+func (r *SpokeReconciler) hubCleanupPreflight(ctx context.Context, spoke *v1beta1.Spoke, addonC *addonapi.Clientset, workC *workapi.Clientset, clusterC *clusterapi.Clientset, pivotComplete bool) (bool, error) {
+	logger := log.FromContext(ctx)
 	// skip clean up if the ManagedCluster resource is not found or if any manifestWorks exist
 	managedCluster, err := clusterC.ClusterV1().ManagedClusters().Get(ctx, spoke.Name, metav1.GetOptions{})
 	if kerrs.IsNotFound(err) {
 		logger.Info("ManagedCluster resource not found; nothing to do")
-		return nil
+		// remove both hub finalizers
+		spoke.Finalizers = slices.DeleteFunc(spoke.Finalizers, func(s string) bool {
+			return s == v1beta1.HubCleanupPreflightFinalizer || s == v1beta1.HubCleanupFinalizer
+		})
+		return false, nil
 	} else if err != nil {
-		return fmt.Errorf("unexpected error listing managedClusters: %w", err)
+		return true, fmt.Errorf("unexpected error listing managedClusters: %w", err)
 	}
+
+	if spoke.Spec.CleanupConfig.ForceClusterDrain {
+		// Apply workload-cleanup taint to remove non-addon workloads via Placement descheduling.
+		// Addons should tolerate this taint if they need to continue running during initial cleanup.
+		if !slices.ContainsFunc(managedCluster.Spec.Taints, func(t clusterv1.Taint) bool {
+			return t.Key == managedClusterWorkloadCleanupTaint.Key && t.Effect == managedClusterWorkloadCleanupTaint.Effect
+		}) {
+			managedCluster.Spec.Taints = append(managedCluster.Spec.Taints, managedClusterWorkloadCleanupTaint)
+			if err := common.UpdateManagedCluster(ctx, clusterC, managedCluster); err != nil {
+				return true, fmt.Errorf("failed to add workload-cleanup taint to ManagedCluster: %w", err)
+			}
+			logger.V(1).Info("added workload-cleanup taint to ManagedCluster", "spokeName", spoke.Name, "taint", managedClusterWorkloadCleanupTaint.Key)
+		}
+	}
+
 	manifestWorks, err := workC.WorkV1().ManifestWorks(managedCluster.Name).List(ctx, metav1.ListOptions{})
 	if err != nil {
-		return fmt.Errorf("failed to list manifestWorks for managedCluster %s: %w", managedCluster.Name, err)
+		return true, fmt.Errorf("failed to list manifestWorks for managedCluster %s: %w", managedCluster.Name, err)
 	}
 
 	// check that the number of manifestWorks is the same as the number of addons enabled for that spoke
 	if len(manifestWorks.Items) > 0 && !allOwnersAddOns(manifestWorks.Items) {
 		msg := fmt.Sprintf("Found manifestWorks for ManagedCluster %s; cannot unjoin spoke cluster while it has active ManifestWorks", managedCluster.Name)
 		logger.Info(msg)
-		return errors.New(msg)
+		return true, errors.New(msg)
 	}
 
 	// remove addons only after confirming that the cluster can be unjoined - this avoids leaving dangling resources that may rely on the addon
@@ -506,7 +600,24 @@ func (r *SpokeReconciler) doHubCleanup(ctx context.Context, spoke *v1beta1.Spoke
 		spoke.SetConditions(true, v1beta1.NewCondition(
 			err.Error(), v1beta1.AddonsConfigured, metav1.ConditionTrue, metav1.ConditionFalse,
 		))
-		return err
+		return true, err
+	}
+
+	// Apply terminating taint to remove all remaining workloads including addons.
+	// This taint should not be tolerated by anything - it signals final cluster termination.
+	// We need to re-fetch the ManagedCluster to get the latest version after the first taint.
+	managedCluster, err = clusterC.ClusterV1().ManagedClusters().Get(ctx, spoke.Name, metav1.GetOptions{})
+	if err != nil && !kerrs.IsNotFound(err) {
+		return true, fmt.Errorf("failed to get ManagedCluster for terminating taint: %w", err)
+	}
+	if managedCluster != nil && !slices.ContainsFunc(managedCluster.Spec.Taints, func(t clusterv1.Taint) bool {
+		return t.Key == managedClusterTerminatingTaint.Key && t.Effect == managedClusterTerminatingTaint.Effect
+	}) {
+		managedCluster.Spec.Taints = append(managedCluster.Spec.Taints, managedClusterTerminatingTaint)
+		if err := common.UpdateManagedCluster(ctx, clusterC, managedCluster); err != nil {
+			return true, fmt.Errorf("failed to add terminating taint to ManagedCluster: %w", err)
+		}
+		logger.V(1).Info("added terminating taint to ManagedCluster", "spokeName", spoke.Name, "taint", managedClusterTerminatingTaint.Key)
 	}
 
 	if len(spoke.Status.EnabledAddons) > 0 {
@@ -515,59 +626,14 @@ func (r *SpokeReconciler) doHubCleanup(ctx context.Context, spoke *v1beta1.Spoke
 			spoke.SetConditions(true, v1beta1.NewCondition(
 				err.Error(), v1beta1.AddonsConfigured, metav1.ConditionTrue, metav1.ConditionFalse,
 			))
-			return fmt.Errorf("addon manifestWorks cleanup failed: %w", err)
+			return true, fmt.Errorf("addon manifestWorks cleanup failed: %w", err)
 		}
 		spoke.SetConditions(true, v1beta1.NewCondition(
 			v1beta1.AddonsConfigured, v1beta1.AddonsConfigured, metav1.ConditionFalse, metav1.ConditionFalse,
 		))
 	}
 
-	// remove preflight cleanup finalizer - this lets the spoke's controller know to proceed with unjoin.
-	spoke.Finalizers = slices.DeleteFunc(spoke.Finalizers, func(s string) bool {
-		return s == v1beta1.HubCleanupPreflightFinalizer
-	})
-
-	// requeue until unjoin is complete by the spoke's controller
-	if slices.Contains(spoke.Finalizers, v1beta1.SpokeCleanupFinalizer) {
-		logger.V(1).Info("Hub preflight complete, waiting for spoke agent to deregister")
-		return nil
-	}
-
-	csrList := &certificatesv1.CertificateSigningRequestList{}
-	if err := r.List(ctx, csrList, client.HasLabels{"open-cluster-management.io/cluster-name"}); err != nil {
-		return err
-	}
-	for _, c := range csrList.Items {
-		trimmedName := csrSuffixPattern.ReplaceAllString(c.Name, "")
-		if trimmedName == spoke.Name {
-			if err := r.Delete(ctx, &c); err != nil {
-				return err
-			}
-		}
-	}
-
-	err = r.waitForAgentAddonDeleted(ctx, spoke, spokeCopy, addonC, workC)
-	if err != nil {
-		return err
-	}
-
-	// remove ManagedCluster
-	err = clusterC.ClusterV1().ManagedClusters().Delete(ctx, spoke.Name, metav1.DeleteOptions{})
-	if err != nil && !kerrs.IsNotFound(err) {
-		return err
-	}
-	// remove Namespace
-	ns := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: spoke.Name}}
-	err = r.Delete(ctx, ns)
-	if err != nil && !kerrs.IsNotFound(err) {
-		return err
-	}
-
-	spoke.Finalizers = slices.DeleteFunc(spoke.Finalizers, func(s string) bool {
-		return s == v1beta1.HubCleanupFinalizer
-	})
-
-	return nil
+	return true, nil
 }
 
 func (r *SpokeReconciler) waitForAgentAddonDeleted(ctx context.Context, spoke *v1beta1.Spoke, spokeCopy *v1beta1.Spoke, addonC *addonapi.Clientset, workC *workapi.Clientset) error {
@@ -618,12 +684,12 @@ func (r *SpokeReconciler) waitForAgentAddonDeleted(ctx context.Context, spoke *v
 }
 
 // doSpokeCleanup handles all the required cleanup of a spoke cluster when deregistering a Spoke
-func (r *SpokeReconciler) doSpokeCleanup(ctx context.Context, spoke *v1beta1.Spoke, pivotComplete bool) error {
+func (r *SpokeReconciler) doSpokeCleanup(ctx context.Context, spoke *v1beta1.Spoke, pivotComplete bool) (bool, error) {
 	logger := log.FromContext(ctx)
 	// requeue until preflight is complete by the hub's controller
 	if slices.Contains(spoke.Finalizers, v1beta1.HubCleanupPreflightFinalizer) {
 		logger.V(1).Info("Cleanup initiated, waiting for hub to complete preflight")
-		return nil
+		return true, nil
 	}
 
 	var (
@@ -638,12 +704,12 @@ func (r *SpokeReconciler) doSpokeCleanup(ctx context.Context, spoke *v1beta1.Spo
 		spokeKubeconfig, err = kube.KubeconfigFromSecretOrCluster(ctx, r.Client, spoke.Spec.Kubeconfig, spoke.Namespace)
 	}
 	if err != nil {
-		return err
+		return true, err
 	}
 
 	err = r.unjoinSpoke(ctx, spoke, spokeKubeconfig)
 	if err != nil {
-		return err
+		return true, err
 	}
 
 	// unified manager/hub-as-spoke/failed pivot case, no further cleanup needed - clusteradm unjoin will have handled it all
@@ -651,26 +717,27 @@ func (r *SpokeReconciler) doSpokeCleanup(ctx context.Context, spoke *v1beta1.Spo
 		spoke.Finalizers = slices.DeleteFunc(spoke.Finalizers, func(s string) bool {
 			return s == v1beta1.SpokeCleanupFinalizer
 		})
-		return nil
+		// requeue, since we need the hub controller to finish it's part of the cleanup
+		return true, nil
 	}
 
 	// remove all remaining klusterlet resources that unjoin did not remove (because of the remaining AMW)
 	if spoke.Spec.CleanupConfig.PurgeKlusterletOperator {
 		restCfg, err := kube.RestConfigFromKubeconfig(spokeKubeconfig)
 		if err != nil {
-			return err
+			return true, err
 		}
 		spokeClient, err := client.New(restCfg, client.Options{})
 		if err != nil {
-			return err
+			return true, err
 		}
 		operatorClient, err := common.OperatorClient(spokeKubeconfig)
 		if err != nil {
-			return err
+			return true, err
 		}
 
 		if err := operatorClient.OperatorV1().Klusterlets().Delete(ctx, "klusterlet", metav1.DeleteOptions{}); err != nil && !kerrs.IsNotFound(err) {
-			return err
+			return true, err
 		}
 
 		for _, nsName := range v1beta1.OCMSpokeNamespaces {
@@ -679,7 +746,7 @@ func (r *SpokeReconciler) doSpokeCleanup(ctx context.Context, spoke *v1beta1.Spo
 			}
 			ns := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: nsName}}
 			if err := spokeClient.Delete(ctx, ns); err != nil && !kerrs.IsNotFound(err) {
-				return err
+				return true, err
 			}
 		}
 	}
@@ -689,7 +756,7 @@ func (r *SpokeReconciler) doSpokeCleanup(ctx context.Context, spoke *v1beta1.Spo
 	})
 
 	logger.V(1).Info("Klusterlet cleanup complete")
-	return nil
+	return false, nil
 }
 
 type tokenMeta struct {

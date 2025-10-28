@@ -129,6 +129,14 @@ const (
 
 	// AgentCleanupWatcherName is the name of the watcher for cleaning up the spoke agent.
 	AgentCleanupWatcherName = "agent-cleanup-watcher"
+
+	// ManagedClusterWorkloadCleanupTaint is applied to a ManagedCluster to remove non-addon workloads.
+	// Addons can tolerate this taint to continue running during initial cleanup phase.
+	ManagedClusterWorkloadCleanupTaint = "fleetconfig.open-cluster-management.io/workload-cleanup"
+
+	// ManagedClusterTerminatingTaint is applied to remove all workloads including addons.
+	// Nothing should tolerate this taint - it signals final cluster termination.
+	ManagedClusterTerminatingTaint = "fleetconfig.open-cluster-management.io/terminating"
 )
 
 // SupportedInstanceTypes are the valid cluster types that the controller can be installed in.
