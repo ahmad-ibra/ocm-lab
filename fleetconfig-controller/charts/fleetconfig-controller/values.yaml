@@ -265,7 +265,7 @@ fleetConfig:
 
 ## @section Topology Resources
 
-## @param topologyResources.enabled Whether to create Namespaces and ManagedClusterSetBindings for the default ManagedClusterSets created when a FleetConfig is created with the DefaultClusterSet feature gate enabled. Additionally, a Namespace, ManagedClusterSet, and Placement are created for targeting all managed clusters that are not the hub running in hub-as-spoke mode.
+## @param topologyResources.enabled Whether to create Namespaces and ManagedClusterSetBindings for the default ManagedClusterSets created when a Hub is created with the DefaultClusterSet feature gate enabled. Additionally, a Namespace, ManagedClusterSet, and Placement are created for targeting all managed clusters that are not the hub running in hub-as-spoke mode.
 topologyResources:
   enabled: true
 
@@ -294,7 +294,7 @@ imageRegistry: ""
 ## @param image.pullPolicy Image pull policy
 image:
   repository: quay.io/open-cluster-management/fleetconfig-controller
-  tag: v0.1.4
+  tag: v0.1.5
   pullPolicy: IfNotPresent
 
 ## @param imagePullSecrets Image pull secrets
