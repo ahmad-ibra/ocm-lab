@@ -23,8 +23,11 @@ spec:
     annotations:
       foo: "bar"
     mode: "Default"
-    purgeOperator: true
     featureGates: "ClusterClaim=true,RawFeedbackJsonString=true"
     forceInternalEndpointLookup: true
     forceInternalEndpointLookupManaged: false
     singleton: false
+  cleanupConfig:
+    purgeAgentNamespace: true
+    purgeKubeconfigSecret: true
+    purgeKlusterletOperator: true
